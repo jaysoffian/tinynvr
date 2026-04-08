@@ -374,60 +374,85 @@ html, body {
   color: var(--text-dim);
   margin-top: 2px;
 }
-.fs-download-row {
+.fs-left-controls {
   display: flex;
-  align-items: center;
-  margin-bottom: 4px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  flex-shrink: 0;
 }
-.fs-download-row .fs-download {
+.fs-download {
   color: var(--text);
   text-decoration: none;
-  font-size: 16px;
   opacity: 0.7;
-  padding: 0;
-}
-.fs-download-row .fs-download:hover { opacity: 1; }
-.fs-scrub-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
 }
-.fs-scrub-row .fs-play {
+.fs-download:hover { opacity: 1; }
+.fs-download svg { width: 20px; height: 20px; }
+.fs-speed {
+  background: rgba(255,255,255,0.12);
+  color: var(--text);
+  border: none;
+  border-radius: 14px;
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  height: 28px;
+}
+.fs-scrub-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+.fs-play-timeline {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  height: 28px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 6px;
+  overflow: visible;
+  position: relative;
+}
+.fs-play {
   background: none;
   border: none;
   color: var(--text);
-  font-size: 14px;
   cursor: pointer;
-  padding: 0;
+  padding: 0 8px;
   flex-shrink: 0;
-  opacity: 0.7;
-  width: 24px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  opacity: 0.9;
 }
-.fs-scrub-row .fs-play:hover { opacity: 1; }
-.fs-scrub-row select {
-  background: rgba(255,255,255,0.15);
-  color: var(--text);
-  border: none;
-  border-radius: 4px;
-  padding: 2px 4px;
-  font-size: 11px;
+.fs-play:hover { opacity: 1; }
+.fs-play svg { width: 14px; height: 14px; }
+.fs-play-divider {
+  width: 1px;
+  height: 16px;
+  background: rgba(255,255,255,0.2);
   flex-shrink: 0;
-  height: 20px;
 }
 .fs-timeline {
   position: relative;
-  height: 20px;
+  height: 100%;
   flex: 1;
 }
 .fs-timeline-bar {
   position: absolute;
-  top: 4px;
+  top: 8px;
   left: 0;
   right: 0;
   height: 12px;
-  background: rgba(255,255,255,0.1);
-  border-radius: 4px;
+  background: transparent;
+  border-radius: 2px;
   overflow: hidden;
 }
 .fs-timeline-segment {
@@ -439,9 +464,9 @@ html, body {
 }
 .fs-timeline-cursor {
   position: absolute;
-  top: 2px;
+  top: 4px;
   width: 2px;
-  height: 16px;
+  height: 20px;
   background: #fff;
   border-radius: 1px;
   transform: translateX(-1px);
@@ -523,19 +548,30 @@ html, body {
               <span class="fs-time-value" x-text="currentTimeDisplay"></span>
               <div class="fs-date-value" x-text="currentDateDisplay"></div>
             </div>
-            <div class="fs-download-row">
-              <a class="fs-download" x-show="camStates[idx]?.currentSegment"
-                 :href="downloadUrl(idx)" download @click.stop title="Download">&#11015;</a>
-            </div>
             <div class="fs-scrub-row">
-              <button class="fs-play" @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
-              <select x-model.number="playbackSpeed" @change="applySpeed()">
-                <option value="1">1x</option>
-                <option value="2">2x</option>
-                <option value="4">4x</option>
-                <option value="8">8x</option>
-              </select>
-              <div class="fs-timeline">
+              <div class="fs-left-controls">
+                <a class="fs-download" x-show="camStates[idx]?.currentSegment"
+                   :href="downloadUrl(idx)" download @click.stop title="Download">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                </a>
+                <select class="fs-speed" x-model.number="playbackSpeed" @change="applySpeed()">
+                  <option value="1">1x</option>
+                  <option value="2">2x</option>
+                  <option value="4">4x</option>
+                  <option value="8">8x</option>
+                </select>
+              </div>
+              <div class="fs-play-timeline">
+                <button class="fs-play" @click.stop="togglePlay">
+                  <svg x-show="!playing" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 20,12 6,21"/></svg>
+                  <svg x-show="playing" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="3" width="4" height="18" rx="1"/><rect x="15" y="3" width="4" height="18" rx="1"/></svg>
+                </button>
+                <div class="fs-play-divider"></div>
+                <div class="fs-timeline">
               <div class="fs-timeline-bar">
                 <template x-for="seg in (segments[cam.name] || [])" :key="'fs-'+seg.filename">
                   <div class="fs-timeline-segment" :style="segmentBlockStyle(seg)"></div>
@@ -550,6 +586,7 @@ html, body {
                    @touchmove.window="doFsScrub($event.touches[0])"
                    @touchend.window="endFsScrub()">
               </div>
+            </div>
             </div>
             </div>
           </div>
