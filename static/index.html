@@ -549,8 +549,7 @@ html, body {
         <video :id="'video-' + idx"
                preload="auto"
                muted
-               playsinline
-               @timeupdate="idx === 0 && onPrimaryTimeUpdate($event)">
+               playsinline>
         </video>
         <div class="no-recording-overlay"
              x-show="!camStates[idx]?.currentSegment"
@@ -678,8 +677,7 @@ function nvr() {
     playbackSpeed: 1,
     fullscreenIdx: null,
     scrubbing: false,
-    animFrameId: null,
-    _seekPendingGen: 0,
+    _clockId: null,
     weekOffset: 0,
     weekDays: [],
     earliestDate: null,
@@ -915,7 +913,6 @@ function nvr() {
         state.currentSegment = seg;
         state.nextSegment = next;
         this._seekVideo(video, seg);
-        if (idx === 0) this._resolveSeekPending(video);
         return;
       }
 
@@ -932,7 +929,6 @@ function nvr() {
       video.onloadedmetadata = () => {
         video.onloadedmetadata = null;
         this._seekVideo(video, seg);
-        if (idx === 0) this._resolveSeekPending(video);
         if (this.playing) {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
@@ -943,57 +939,13 @@ function nvr() {
     },
 
     _seekVideo(video, seg) {
-      if (!video || !seg || !this.wallTime) return false;
+      if (!video || !seg || !this.wallTime) return;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
       const dur = isNaN(video.duration) ? SEGMENT_DURATION : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
-        return true;
-      }
-      return false;
-    },
-
-    _resolveSeekPending(video) {
-      if (this._seekPendingGen === 0) return;
-      const gen = this._seekPendingGen;
-      if (video.seeking) {
-        video.addEventListener('seeked', () => {
-          if (this._seekPendingGen === gen) this._seekPendingGen = 0;
-        }, { once: true });
-      } else {
-        this._seekPendingGen = 0;
-      }
-    },
-
-    onPrimaryTimeUpdate(event) {
-      if (!this.playing || this.scrubbing || this._seekPendingGen > 0) return;
-      const video = event.target;
-      if (video.seeking || video.readyState < 2) return;
-
-      const state = this.camStates[0];
-      if (!state || !state.currentSegment) return;
-
-      const segStart = this._parseStart(state.currentSegment).getTime();
-      this.wallTime = new Date(segStart + video.currentTime * 1000);
-
-      // Sync non-primary cameras
-      for (let i = 1; i < this.cameras.length; i++) {
-        const cs = this.camStates[i];
-        if (!cs) continue;
-
-        if (!cs.currentSegment) {
-          const found = this.findSegmentAt(this.cameras[i].name, this.wallTime);
-          if (found) this.loadSegmentForCamera(i);
-        } else {
-          const segEnd = this._parseStart(cs.currentSegment).getTime() + SEGMENT_DURATION * 1000;
-          if (this.wallTime.getTime() >= segEnd || this.wallTime.getTime() < this._parseStart(cs.currentSegment).getTime()) {
-            this.loadSegmentForCamera(i);
-          } else {
-            this._seekVideo(this.getVideo(i), cs.currentSegment);
-          }
-        }
       }
     },
 
@@ -1004,9 +956,6 @@ function nvr() {
       if (!state.nextSegment) {
         state.currentSegment = null;
         state.loadedSrc = null;
-        if (idx === 0 && this.playing) {
-          this.startFreeRunning();
-        }
         return;
       }
 
@@ -1029,60 +978,83 @@ function nvr() {
 
     play() {
       this.playing = true;
-      let hasPrimary = false;
-
       this.cameras.forEach((_, idx) => {
         const video = this.getVideo(idx);
         const state = this.camStates[idx];
         if (video && state?.currentSegment) {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
-          if (idx === 0) hasPrimary = true;
         }
       });
-
-      if (!hasPrimary) {
-        this.startFreeRunning();
-      }
+      this._startClock();
     },
 
     pause() {
       this.playing = false;
-      this.stopFreeRunning();
+      this._stopClock();
       this.cameras.forEach((_, idx) => {
         const video = this.getVideo(idx);
         if (video && !video.paused) video.pause();
       });
     },
 
-    startFreeRunning() {
-      this.stopFreeRunning();
+    _startClock() {
+      this._stopClock();
       let lastTick = performance.now();
       const tick = (now) => {
         if (!this.playing) return;
-        if (this.camStates[0]?.currentSegment) {
-          this.animFrameId = null;
-          return;
-        }
-        const elapsed = (now - lastTick) / 1000 * this.playbackSpeed;
-        lastTick = now;
-        this.wallTime = new Date(this.wallTime.getTime() + elapsed * 1000);
 
-        this.cameras.forEach((cam, idx) => {
-          if (!this.camStates[idx]?.currentSegment) {
-            const found = this.findSegmentAt(cam.name, this.wallTime);
-            if (found) this.loadSegmentForCamera(idx);
+        const dt = (now - lastTick) / 1000;
+        lastTick = now;
+
+        if (!this.scrubbing && !this._fsScrubbing) {
+          // Derive wallTime from primary video when it's usable;
+          // otherwise advance by real elapsed time (free-running).
+          const v0 = this.getVideo(0);
+          const s0 = this.camStates[0];
+          if (v0 && s0?.currentSegment && !v0.paused && !v0.seeking && v0.readyState >= 2) {
+            const segStart = this._parseStart(s0.currentSegment).getTime();
+            this.wallTime = new Date(segStart + v0.currentTime * 1000);
+          } else {
+            this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
           }
-        });
-        this.animFrameId = requestAnimationFrame(tick);
+        }
+
+        // Sync all cameras: check segment boundaries, load new segments
+        for (let i = 0; i < this.cameras.length; i++) {
+          const state = this.camStates[i];
+          if (!state) continue;
+          if (!state.currentSegment) {
+            const found = this.findSegmentAt(this.cameras[i].name, this.wallTime);
+            if (found) this.loadSegmentForCamera(i);
+          } else {
+            const segStart = this._parseStart(state.currentSegment).getTime();
+            const segEnd = segStart + SEGMENT_DURATION * 1000;
+            const wt = this.wallTime.getTime();
+            if (wt >= segEnd || wt < segStart) {
+              this.loadSegmentForCamera(i);
+            } else if (i > 0) {
+              // Keep non-primary cameras in sync (only seek if drift > 2s)
+              const video = this.getVideo(i);
+              if (video && !video.seeking && video.readyState >= 2) {
+                const offset = (wt - segStart) / 1000;
+                if (Math.abs(video.currentTime - offset) > 2) {
+                  video.currentTime = offset;
+                }
+              }
+            }
+          }
+        }
+
+        this._clockId = requestAnimationFrame(tick);
       };
-      this.animFrameId = requestAnimationFrame(tick);
+      this._clockId = requestAnimationFrame(tick);
     },
 
-    stopFreeRunning() {
-      if (this.animFrameId) {
-        cancelAnimationFrame(this.animFrameId);
-        this.animFrameId = null;
+    _stopClock() {
+      if (this._clockId) {
+        cancelAnimationFrame(this._clockId);
+        this._clockId = null;
       }
     },
 
@@ -1119,7 +1091,6 @@ function nvr() {
     },
 
     _seekByKey(ms) {
-      this._seekPendingGen++;
       this.wallTime = new Date(this.wallTime.getTime() + ms);
       this.loadSegmentsForAll();
     },
@@ -1150,7 +1121,6 @@ function nvr() {
 
     endScrub() {
       if (!this.scrubbing) return;
-      this._seekPendingGen++;
       this.scrubbing = false;
       this.loadSegmentsForAll();
     },
@@ -1185,7 +1155,6 @@ function nvr() {
 
     endFsScrub() {
       if (!this._fsScrubbing) return;
-      this._seekPendingGen++;
       this._fsScrubbing = false;
       this._fsScrubEl = null;
       this.loadSegmentsForAll();

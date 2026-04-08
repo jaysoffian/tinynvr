@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import Response
 
 from tinynvr.config import (
     Config,
@@ -183,6 +183,12 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
     return segments
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    """Resolve when the client closes the connection."""
+    while not await request.is_disconnected():
+        await asyncio.sleep(0.5)
+
+
 @app.get("/api/segments/{camera_name}/{filename}")
 async def serve_segment(
     camera_name: str,
@@ -219,24 +225,36 @@ async def serve_segment(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    async def _stream() -> AsyncGenerator[bytes]:
-        assert proc.stdout is not None
-        try:
-            while True:
-                chunk = await proc.stdout.read(256 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            # Kill ffmpeg immediately when client disconnects or we're done
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+    # Race ffmpeg against client disconnect so we kill the process
+    # if the browser moves to a different segment during scrubbing
+    comm_task = asyncio.create_task(proc.communicate())
+    disc_task = asyncio.create_task(_wait_for_disconnect(request))
+    try:
+        done, _ = await asyncio.wait(
+            {comm_task, disc_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        disc_task.cancel()
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if not comm_task.done():
+            comm_task.cancel()
+
+    if comm_task not in done:
+        return Response(status_code=499)
+
+    stdout, stderr = comm_task.result()
+
+    if proc.returncode != 0:
+        error = stderr.decode(errors="replace").strip()
+        logger.warning("Remux failed for %s: %s", file_path, error)
+        raise HTTPException(status_code=500, detail="Failed to remux segment")
 
     mp4_name = filename.replace(".mkv", ".mp4")
     disposition = "attachment" if download else "inline"
-    return StreamingResponse(
-        _stream(),
+    return Response(
+        content=stdout,
         media_type="video/mp4",
         headers={"Content-Disposition": f'{disposition}; filename="{mp4_name}"'},
     )
