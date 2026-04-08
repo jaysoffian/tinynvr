@@ -94,7 +94,8 @@ html, body {
 .week-picker .wp-day.today .wp-day-label {
   color: #e87530;
 }
-.week-picker .wp-day.future {
+.week-picker .wp-day.future,
+.week-picker .wp-day.no-data {
   opacity: 0.3;
   pointer-events: none;
 }
@@ -445,11 +446,11 @@ html, body {
   <!-- Top bar -->
   <div class="topbar">
     <div class="week-picker">
-      <button class="wp-arrow" @click="weekOffset--; buildWeek()">&lsaquo;</button>
+      <button class="wp-arrow" :style="!canGoBack && 'opacity:0.2;pointer-events:none'" @click="weekOffset--; buildWeek()">&lsaquo;</button>
       <template x-for="day in weekDays" :key="day.iso">
         <div class="wp-day"
-             :class="{ selected: day.iso === selectedDate, today: day.isToday, future: day.isFuture }"
-             @click="!day.isFuture && changeDate(day.iso)">
+             :class="{ selected: day.iso === selectedDate, today: day.isToday, future: day.isFuture, 'no-data': day.beforeEarliest }"
+             @click="!day.isFuture && !day.beforeEarliest && changeDate(day.iso)">
           <span class="wp-day-label" x-text="day.label"></span>
           <span class="wp-day-num" x-text="day.num"></span>
         </div>
@@ -600,6 +601,8 @@ function nvr() {
     animFrameId: null,
     weekOffset: 0,
     weekDays: [],
+    earliestDate: null,
+    canGoBack: true,
 
     get currentTimeDisplay() {
       if (!this.wallTime) return '--:--:--';
@@ -623,7 +626,6 @@ function nvr() {
       const DAY_LABELS = ['S','M','T','W','T','F','S'];
       const today = new Date();
       today.setHours(0,0,0,0);
-      // Find Sunday of the current week, then offset
       const sunday = new Date(today);
       sunday.setDate(sunday.getDate() - sunday.getDay() + this.weekOffset * 7);
       const days = [];
@@ -637,9 +639,17 @@ function nvr() {
           num: d.getDate(),
           isToday: d.getTime() === today.getTime(),
           isFuture: d > today,
+          beforeEarliest: this.earliestDate ? iso < this.earliestDate : false,
         });
       }
       this.weekDays = days;
+      // Disable back arrow if the entire previous week would be before earliest
+      if (this.earliestDate) {
+        const prevSat = new Date(sunday);
+        prevSat.setDate(prevSat.getDate() - 1);
+        const prevSatIso = `${prevSat.getFullYear()}-${String(prevSat.getMonth()+1).padStart(2,'0')}-${String(prevSat.getDate()).padStart(2,'0')}`;
+        this.canGoBack = prevSatIso >= this.earliestDate;
+      }
     },
 
     get gridColumns() {
@@ -647,6 +657,11 @@ function nvr() {
     },
 
     async init() {
+      try {
+        const res = await fetch('/api/recordings/range');
+        const range = await res.json();
+        this.earliestDate = range.earliest;
+      } catch (e) {}
       this.buildWeek();
       await this.fetchCameras();
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
