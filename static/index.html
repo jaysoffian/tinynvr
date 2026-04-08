@@ -678,7 +678,7 @@ function nvr() {
     playbackSpeed: 1,
     fullscreenIdx: null,
     scrubbing: false,
-    seeking: false,
+    _manualSeek: false,
     animFrameId: null,
     weekOffset: 0,
     weekDays: [],
@@ -956,8 +956,9 @@ function nvr() {
     },
 
     onPrimaryTimeUpdate(event) {
-      if (!this.playing || this.scrubbing || this.seeking) return;
+      if (!this.playing || this.scrubbing || this._manualSeek) return;
       const video = event.target;
+      if (video.seeking) return;
       const state = this.camStates[0];
       if (!state || !state.currentSegment) return;
 
@@ -1111,12 +1112,19 @@ function nvr() {
     },
 
     _seekByKey(ms) {
-      this.seeking = true;
+      this._manualSeek = true;
       this.wallTime = new Date(this.wallTime.getTime() + ms);
       this.loadSegmentsForAll();
-      // Clear seeking flag after videos have had time to seek
-      clearTimeout(this._seekTimer);
-      this._seekTimer = setTimeout(() => { this.seeking = false; }, 200);
+      // Clear flag once primary video finishes seeking
+      const primary = this.getVideo(0);
+      if (primary) {
+        primary.addEventListener('seeked', () => { this._manualSeek = false; }, { once: true });
+        // Fallback in case seeked never fires (no source, etc.)
+        clearTimeout(this._seekTimer);
+        this._seekTimer = setTimeout(() => { this._manualSeek = false; }, 500);
+      } else {
+        this._manualSeek = false;
+      }
     },
 
     // -- Timeline --
