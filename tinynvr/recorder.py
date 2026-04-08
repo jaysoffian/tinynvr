@@ -119,27 +119,23 @@ class CameraRecorder:
         self.state = CameraState.RECORDING
 
     async def _sidecar_loop(self) -> None:
-        """Periodically write .json sidecars for completed segments.
-
-        Only checks the last few files — older ones already have sidecars.
-        """
+        """Periodically write .json sidecars for completed segments."""
         while True:
             await asyncio.sleep(60)
             if not self.output_dir.is_dir():
                 continue
-            # Only look at the most recent files (sorted desc by name = by time)
-            recent = sorted(
-                (p for p in self.output_dir.iterdir() if p.suffix == ".mkv"),
-                key=lambda p: p.name,
-                reverse=True,
-            )[:5]
-            if not recent:
-                continue
+            mkvs = set()
+            jsons = set()
+            for p in self.output_dir.iterdir():
+                if p.suffix == ".mkv":
+                    mkvs.add(p)
+                elif p.suffix == ".json":
+                    jsons.add(p.with_suffix(".mkv"))
+            missing = sorted(mkvs - jsons, key=lambda p: p.name)
             # Skip the newest file if we're actively recording —
             # it's the one ffmpeg is currently writing to.
-            if self.state == CameraState.RECORDING and recent:
-                recent = recent[1:]
-            missing = [p for p in recent if not p.with_suffix(".json").exists()]
+            if self.state == CameraState.RECORDING and missing:
+                missing = missing[:-1]
             if missing:
                 await ensure_durations(missing)
 
