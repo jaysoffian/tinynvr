@@ -948,13 +948,18 @@ function nvr() {
     },
 
     _latestEnd() {
-      // Find the latest segment end across all cameras
+      // Find the latest playable segment end across all cameras.
+      // Segments without duration_sec are still being recorded and can't
+      // be played, so skip them.
       let latest = 0;
       for (const cam of this.cameras) {
         const segs = this.segments[cam.name] || [];
-        if (segs.length > 0) {
-          const end = this._segEnd(segs, segs.length - 1);
-          if (end > latest) latest = end;
+        for (let i = segs.length - 1; i >= 0; i--) {
+          if (segs[i].duration_sec != null) {
+            const end = this._segEnd(segs, i);
+            if (end > latest) latest = end;
+            break;
+          }
         }
       }
       return latest;
