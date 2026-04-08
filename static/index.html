@@ -679,8 +679,7 @@ function nvr() {
     fullscreenIdx: null,
     scrubbing: false,
     animFrameId: null,
-    _seekGen: 0,
-    _settledGen: 0,
+    _seekPendingGen: 0,
     weekOffset: 0,
     weekDays: [],
     earliestDate: null,
@@ -901,6 +900,7 @@ function nvr() {
           state.nextSegment = null;
           state.loadedSrc = null;
         }
+        video.onloadedmetadata = null;
         video.removeAttribute('src');
         video.load();
         return;
@@ -915,6 +915,7 @@ function nvr() {
         state.currentSegment = seg;
         state.nextSegment = next;
         this._seekVideo(video, seg);
+        if (idx === 0) this._resolveSeekPending(video);
         return;
       }
 
@@ -926,41 +927,50 @@ function nvr() {
 
       video.src = url;
 
-      const onReady = () => {
+      // Use onloadedmetadata (not addEventListener) so that rapid segment
+      // changes replace the handler instead of accumulating stale listeners
+      video.onloadedmetadata = () => {
+        video.onloadedmetadata = null;
         this._seekVideo(video, seg);
+        if (idx === 0) this._resolveSeekPending(video);
         if (this.playing) {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
         }
       };
 
-      video.addEventListener('loadedmetadata', onReady, { once: true });
-
-      // Handle segment end: load next
       video.onended = () => this._onSegmentEnd(idx);
     },
 
     _seekVideo(video, seg) {
-      if (!video || !seg || !this.wallTime) return;
+      if (!video || !seg || !this.wallTime) return false;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
       const dur = isNaN(video.duration) ? SEGMENT_DURATION : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
+        return true;
+      }
+      return false;
+    },
+
+    _resolveSeekPending(video) {
+      if (this._seekPendingGen === 0) return;
+      const gen = this._seekPendingGen;
+      if (video.seeking) {
+        video.addEventListener('seeked', () => {
+          if (this._seekPendingGen === gen) this._seekPendingGen = 0;
+        }, { once: true });
+      } else {
+        this._seekPendingGen = 0;
       }
     },
 
     onPrimaryTimeUpdate(event) {
-      if (!this.playing || this.scrubbing) return;
+      if (!this.playing || this.scrubbing || this._seekPendingGen > 0) return;
       const video = event.target;
       if (video.seeking || video.readyState < 2) return;
-
-      // After a seek, skip the first post-seek timeupdate (stale data)
-      if (this._settledGen !== this._seekGen) {
-        this._settledGen = this._seekGen;
-        return;
-      }
 
       const state = this.camStates[0];
       if (!state || !state.currentSegment) return;
@@ -974,11 +984,9 @@ function nvr() {
         if (!cs) continue;
 
         if (!cs.currentSegment) {
-          // Maybe a segment appeared at the current wallTime
           const found = this.findSegmentAt(this.cameras[i].name, this.wallTime);
           if (found) this.loadSegmentForCamera(i);
         } else {
-          // Check if we've drifted into a different segment
           const segEnd = this._parseStart(cs.currentSegment).getTime() + SEGMENT_DURATION * 1000;
           if (this.wallTime.getTime() >= segEnd || this.wallTime.getTime() < this._parseStart(cs.currentSegment).getTime()) {
             this.loadSegmentForCamera(i);
@@ -996,7 +1004,6 @@ function nvr() {
       if (!state.nextSegment) {
         state.currentSegment = null;
         state.loadedSrc = null;
-        // If primary ended with no next, start free-running
         if (idx === 0 && this.playing) {
           this.startFreeRunning();
         }
@@ -1034,7 +1041,6 @@ function nvr() {
         }
       });
 
-      // If primary camera has no segment, advance wallTime via requestAnimationFrame
       if (!hasPrimary) {
         this.startFreeRunning();
       }
@@ -1054,7 +1060,6 @@ function nvr() {
       let lastTick = performance.now();
       const tick = (now) => {
         if (!this.playing) return;
-        // If primary got a segment, stop free-running
         if (this.camStates[0]?.currentSegment) {
           this.animFrameId = null;
           return;
@@ -1063,7 +1068,6 @@ function nvr() {
         lastTick = now;
         this.wallTime = new Date(this.wallTime.getTime() + elapsed * 1000);
 
-        // Check if any camera now has a segment
         this.cameras.forEach((cam, idx) => {
           if (!this.camStates[idx]?.currentSegment) {
             const found = this.findSegmentAt(cam.name, this.wallTime);
@@ -1115,7 +1119,7 @@ function nvr() {
     },
 
     _seekByKey(ms) {
-      this._seekGen++;
+      this._seekPendingGen++;
       this.wallTime = new Date(this.wallTime.getTime() + ms);
       this.loadSegmentsForAll();
     },
@@ -1146,7 +1150,7 @@ function nvr() {
 
     endScrub() {
       if (!this.scrubbing) return;
-      this._seekGen++;
+      this._seekPendingGen++;
       this.scrubbing = false;
       this.loadSegmentsForAll();
     },
@@ -1181,7 +1185,7 @@ function nvr() {
 
     endFsScrub() {
       if (!this._fsScrubbing) return;
-      this._seekGen++;
+      this._seekPendingGen++;
       this._fsScrubbing = false;
       this._fsScrubEl = null;
       this.loadSegmentsForAll();
