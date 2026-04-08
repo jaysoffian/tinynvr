@@ -196,7 +196,7 @@ html, body {
 }
 .video-panel:hover .panel-actions a { opacity: 0.8; }
 .panel-actions a:hover { opacity: 1 !important; }
-.video-panel.fullscreen-panel .panel-actions { z-index: 11; }
+.video-panel.fullscreen-panel .panel-actions { display: none; }
 
 .no-recording-overlay {
   position: absolute;
@@ -332,7 +332,7 @@ html, body {
   right: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 10px;
   padding: 12px 16px;
   background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
 }
@@ -389,7 +389,17 @@ html, body {
   font-size: 14px;
   cursor: pointer;
 }
-.fs-controls button:hover { background: rgba(255,255,255,0.25); }
+.fs-controls button:hover, .fs-controls a:hover { background: rgba(255,255,255,0.25); }
+.fs-controls .fs-download {
+  color: var(--text);
+  background: rgba(0,0,0,0.6);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 18px;
+  text-decoration: none;
+  opacity: 0.8;
+}
+.fs-controls .spacer { flex: 1; }
 .fs-controls select {
   background: rgba(255,255,255,0.15);
   color: var(--text);
@@ -500,7 +510,6 @@ html, body {
           <div class="fs-top">
             <button class="fs-close" @click="fullscreenIdx = null">&times;</button>
             <span class="fs-cam-name" x-text="cam.name"></span>
-            <div class="spacer"></div>
           </div>
           <div class="fs-bottom">
             <div class="fs-time">
@@ -508,6 +517,9 @@ html, body {
               <div class="fs-date-value" x-text="currentDateDisplay"></div>
             </div>
             <div class="fs-controls">
+              <a class="fs-download" x-show="camStates[idx]?.currentSegment"
+                 :href="downloadUrl(idx)" download @click.stop title="Download">&#11015;</a>
+              <div class="spacer"></div>
               <button @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
               <select x-model.number="playbackSpeed" @change="applySpeed()">
                 <option value="1">1x</option>
