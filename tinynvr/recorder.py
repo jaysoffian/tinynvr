@@ -9,7 +9,7 @@ import time
 from enum import StrEnum
 from pathlib import Path
 
-from nvr.config import CameraConfig, Config, StorageConfig, save_config
+from tinynvr.config import CameraConfig, Config, StorageConfig, save_config
 
 logger = logging.getLogger(__name__)
 

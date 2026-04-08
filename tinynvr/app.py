@@ -13,14 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
-from nvr.config import (
+from tinynvr.config import (
     Config,
     config_to_dict,
     load_config,
     save_config,
 )
-from nvr.recorder import RecordingManager
-from nvr.retention import retention_loop
+from tinynvr.recorder import RecordingManager
+from tinynvr.retention import retention_loop
 
 logger = logging.getLogger(__name__)
 
