@@ -20,7 +20,7 @@ _yaml.preserve_quotes = True
 class StorageConfig:
     path: str = "./recordings"
     retention_days: int = 7
-    segment_seconds: int = 300
+    segment_minutes: int = 5
 
 
 @dataclass
@@ -48,7 +48,7 @@ def _parse_storage(data: dict[str, Any]) -> StorageConfig:
     return StorageConfig(
         path=data.get("path", "./recordings"),
         retention_days=data.get("retention_days", 7),
-        segment_seconds=data.get("segment_seconds", 300),
+        segment_minutes=data.get("segment_minutes", 5),
     )
 
 
@@ -77,7 +77,7 @@ def config_to_dict(config: Config) -> dict[str, Any]:
         "storage": {
             "path": config.storage.path,
             "retention_days": config.storage.retention_days,
-            "segment_seconds": config.storage.segment_seconds,
+            "segment_minutes": config.storage.segment_minutes,
         },
         "cameras": {
             name: {

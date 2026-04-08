@@ -34,7 +34,7 @@ Copy `config.yaml.example` to `config.yaml` and edit:
 storage:
   path: ./recordings
   retention_days: 7
-  segment_seconds: 300
+  segment_minutes: 5
 
 cameras:
   front-door:

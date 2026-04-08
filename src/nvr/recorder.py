@@ -66,7 +66,7 @@ class CameraRecorder:
             "-reset_timestamps",
             "1",
             "-segment_time",
-            str(self.storage.segment_seconds),
+            str(self.storage.segment_minutes * 60),
             "-segment_format",
             "mp4",
             "-segment_atclocktime",
