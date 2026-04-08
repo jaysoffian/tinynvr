@@ -3,7 +3,7 @@
 A lightweight, self-hosted NVR that records RTSP camera streams and provides a web UI for synced multi-camera playback with timeline scrubbing.
 
 - Records via ffmpeg with no transcoding (`-c copy`), near-zero CPU
-- 5-minute fragmented MP4 segments, crash-safe
+- Configurable segment length (1–60 minutes), crash-safe
 - 2×2 synced multi-camera viewer with 24-hour timeline
 - HomeAssistant webhook to toggle cameras on/off
 - 7-day rolling retention
@@ -34,7 +34,7 @@ Copy `config.yaml.example` to `config.yaml` and edit:
 storage:
   path: ./recordings
   retention_days: 7
-  segment_minutes: 5
+  segment_minutes: 5    # 1–60
 
 cameras:
   front-door:

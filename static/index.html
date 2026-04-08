@@ -664,7 +664,6 @@ html, body {
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
 <script>
 function nvr() {
-  const SEGMENT_DURATION = 300; // 5 minutes in seconds
   const SECONDS_PER_DAY = 86400;
 
   return {
@@ -742,9 +741,16 @@ function nvr() {
 
     async init() {
       try {
-        const res = await fetch('/api/recordings/range');
-        const range = await res.json();
+        const [rangeRes, configRes] = await Promise.all([
+          fetch('/api/recordings/range'),
+          fetch('/api/config'),
+        ]);
+        const range = await rangeRes.json();
         this.earliestDate = range.earliest;
+        const config = await configRes.json();
+        if (config.storage?.segment_minutes) {
+          this._segmentDurationMs = config.storage.segment_minutes * 60 * 1000;
+        }
       } catch (e) {}
       this.buildWeek();
       await this.fetchCameras();
@@ -843,12 +849,19 @@ function nvr() {
       return new Date(seg.start_time);
     },
 
+    _segEnd(segs, i) {
+      // Use segment_minutes from config as the max duration.
+      // Actual duration is only known once the video loads (video.duration),
+      // but for segment lookup and timeline display this upper bound is fine.
+      return this._parseStart(segs[i]).getTime() + this._segmentDurationMs;
+    },
+
     findSegmentAt(camName, time) {
       const segs = this.segments[camName] || [];
       const t = time.getTime();
       for (let i = 0; i < segs.length; i++) {
         const start = this._parseStart(segs[i]).getTime();
-        const end = start + SEGMENT_DURATION * 1000;
+        const end = this._segEnd(segs, i);
         if (t >= start && t < end) {
           return { segment: segs[i], index: i };
         }
@@ -913,6 +926,10 @@ function nvr() {
         state.currentSegment = seg;
         state.nextSegment = next;
         this._seekVideo(video, seg);
+        if (this.playing && video.paused) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
+        }
         return;
       }
 
@@ -924,8 +941,8 @@ function nvr() {
 
       video.src = url;
 
-      // Use onloadedmetadata (not addEventListener) so that rapid segment
-      // changes replace the handler instead of accumulating stale listeners
+      // Use onX (not addEventListener) so that rapid segment changes
+      // replace the handler instead of accumulating stale listeners
       video.onloadedmetadata = () => {
         video.onloadedmetadata = null;
         this._seekVideo(video, seg);
@@ -935,6 +952,12 @@ function nvr() {
         }
       };
 
+      video.onerror = () => {
+        video.onerror = null;
+        // Segment failed to load (corrupt file, 500, etc.) — skip it
+        this._onSegmentEnd(idx);
+      };
+
       video.onended = () => this._onSegmentEnd(idx);
     },
 
@@ -942,7 +965,7 @@ function nvr() {
       if (!video || !seg || !this.wallTime) return;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
-      const dur = isNaN(video.duration) ? SEGMENT_DURATION : video.duration;
+      const dur = isNaN(video.duration) ? this._segmentDurationMs / 1000 : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
@@ -1006,30 +1029,37 @@ function nvr() {
 
         const dt = (now - lastTick) / 1000;
         lastTick = now;
+        const settling = now < this._seekUntil;
 
-        if (!this.scrubbing && !this._fsScrubbing) {
-          // Derive wallTime from primary video when it's usable;
-          // otherwise advance by real elapsed time (free-running).
+        if (!this.scrubbing && !this._fsScrubbing && !settling) {
           const v0 = this.getVideo(0);
           const s0 = this.camStates[0];
+
           if (v0 && s0?.currentSegment && !v0.paused && !v0.seeking && v0.readyState >= 2) {
+            // Sync clock from primary video to prevent drift
             const segStart = this._parseStart(s0.currentSegment).getTime();
             this.wallTime = new Date(segStart + v0.currentTime * 1000);
           } else {
+            // Video not usable — free-run the clock
             this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
           }
         }
+        // During settling: wallTime stays at the value set by the seek.
+        // During scrubbing: wallTime is driven by the scrub handler.
 
         // Sync all cameras: check segment boundaries, load new segments
         for (let i = 0; i < this.cameras.length; i++) {
           const state = this.camStates[i];
           if (!state) continue;
+          const camName = this.cameras[i].name;
+          const segs = this.segments[camName] || [];
           if (!state.currentSegment) {
-            const found = this.findSegmentAt(this.cameras[i].name, this.wallTime);
+            const found = this.findSegmentAt(camName, this.wallTime);
             if (found) this.loadSegmentForCamera(i);
           } else {
+            const segIdx = segs.indexOf(state.currentSegment);
             const segStart = this._parseStart(state.currentSegment).getTime();
-            const segEnd = segStart + SEGMENT_DURATION * 1000;
+            const segEnd = segIdx >= 0 ? this._segEnd(segs, segIdx) : segStart + this._segmentDurationMs;
             const wt = this.wallTime.getTime();
             if (wt >= segEnd || wt < segStart) {
               this.loadSegmentForCamera(i);
@@ -1090,8 +1120,11 @@ function nvr() {
       }
     },
 
+    _seekUntil: 0, // performance.now() deadline; suppresses video→clock sync
+
     _seekByKey(ms) {
       this.wallTime = new Date(this.wallTime.getTime() + ms);
+      this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
 
@@ -1102,7 +1135,8 @@ function nvr() {
       const sod = this._startOfDay();
       const startSec = (start - sod) / 1000;
       const left = startSec / SECONDS_PER_DAY * 100;
-      const width = SEGMENT_DURATION / SECONDS_PER_DAY * 100;
+      const durSec = this._segmentDurationMs / 1000;
+      const width = durSec / SECONDS_PER_DAY * 100;
       return `left:${left}%;width:${width}%`;
     },
 
@@ -1122,6 +1156,7 @@ function nvr() {
     endScrub() {
       if (!this.scrubbing) return;
       this.scrubbing = false;
+      this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
 
@@ -1138,6 +1173,7 @@ function nvr() {
 
     // -- Fullscreen scrubbing --
 
+    _segmentDurationMs: 300000, // fallback; updated from config API in init()
     _fsScrubbing: false,
     _fsScrubEl: null,
 
@@ -1157,6 +1193,7 @@ function nvr() {
       if (!this._fsScrubbing) return;
       this._fsScrubbing = false;
       this._fsScrubEl = null;
+      this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
 

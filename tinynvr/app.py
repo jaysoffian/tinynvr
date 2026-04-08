@@ -162,7 +162,6 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
             continue
         if segment_path.suffix != ".mkv" or not segment_path.is_file():
             continue
-        # Parse start_time from filename: 2026-04-08_02-52-34.mp4
         try:
             start_time = (
                 datetime.strptime(segment_path.stem, "%Y-%m-%d_%H-%M-%S")

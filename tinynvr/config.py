@@ -45,10 +45,18 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
 
 
 def _parse_storage(data: dict[str, Any]) -> StorageConfig:
+    segment_minutes = max(1, min(60, data.get("segment_minutes", 5)))
+    raw_value = data.get("segment_minutes", 5)
+    if raw_value != segment_minutes:
+        logger.warning(
+            "segment_minutes=%d out of range 1-60, clamped to %d",
+            raw_value,
+            segment_minutes,
+        )
     return StorageConfig(
         path=data.get("path", "./recordings"),
         retention_days=data.get("retention_days", 7),
-        segment_minutes=data.get("segment_minutes", 5),
+        segment_minutes=segment_minutes,
     )
 
 
