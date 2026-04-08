@@ -678,7 +678,6 @@ function nvr() {
     playbackSpeed: 1,
     fullscreenIdx: null,
     scrubbing: false,
-    _seekTarget: null,
     animFrameId: null,
     weekOffset: 0,
     weekDays: [],
@@ -958,18 +957,7 @@ function nvr() {
       if (!state || !state.currentSegment) return;
 
       const segStart = this._parseStart(state.currentSegment).getTime();
-      const computed = segStart + video.currentTime * 1000;
-
-      // After a manual seek, wait until the video has moved away from its
-      // pre-seek position (i.e. it's no longer reporting stale currentTime).
-      // Keyframes can be several seconds apart, so we just check that the
-      // video isn't still at the position it was before the seek.
-      if (this._seekTarget) {
-        if (Math.abs(computed - this._seekTarget) > 5000) return;
-        this._seekTarget = null;
-      }
-
-      this.wallTime = new Date(computed);
+      this.wallTime = new Date(segStart + video.currentTime * 1000);
 
       // Sync non-primary cameras
       for (let i = 1; i < this.cameras.length; i++) {
@@ -1118,9 +1106,22 @@ function nvr() {
     },
 
     _seekByKey(ms) {
+      // Pause videos to prevent stale timeupdate events during seek
+      const paused = [];
+      this.cameras.forEach((_, idx) => {
+        const v = this.getVideo(idx);
+        if (v && !v.paused) { v.pause(); paused.push(v); }
+      });
+
       this.wallTime = new Date(this.wallTime.getTime() + ms);
-      this._seekTarget = this.wallTime.getTime();
       this.loadSegmentsForAll();
+
+      // Resume after seeks settle
+      if (paused.length > 0 && this.playing) {
+        setTimeout(() => {
+          paused.forEach(v => { v.playbackRate = this.playbackSpeed; v.play().catch(() => {}); });
+        }, 50);
+      }
     },
 
     // -- Timeline --
