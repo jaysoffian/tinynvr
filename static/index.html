@@ -118,6 +118,12 @@ html, body {
   line-height: 1;
 }
 .topbar button:hover { background: var(--border); }
+.topbar-play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.topbar-play svg { width: 16px; height: 16px; }
 .topbar .time-display {
   font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
   font-size: 16px;
@@ -186,13 +192,16 @@ html, body {
 }
 .panel-actions a {
   color: var(--text);
-  background: rgba(0,0,0,0.6);
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 18px;
   text-decoration: none;
   opacity: 0;
   transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.panel-actions a svg {
+  width: 20px;
+  height: 20px;
 }
 .video-panel:hover .panel-actions a { opacity: 0.8; }
 .panel-actions a:hover { opacity: 1 !important; }
@@ -503,7 +512,10 @@ html, body {
       </template>
       <button class="wp-arrow" @click="weekOffset++; buildWeek()">&rsaquo;</button>
     </div>
-    <button @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
+    <button class="topbar-play" @click="togglePlay">
+      <svg x-show="!playing" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><polygon points="6,3 20,12 6,21"/></svg>
+      <svg x-show="playing" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><rect x="5" y="3" width="4" height="18" rx="1"/><rect x="15" y="3" width="4" height="18" rx="1"/></svg>
+    </button>
     <select x-model.number="playbackSpeed" @change="applySpeed()">
       <option value="0.25">0.25x</option>
       <option value="0.5">0.5x</option>
@@ -526,7 +538,13 @@ html, body {
           <span class="cam-name" x-text="cam.name"></span>
         </div>
         <div class="panel-actions" x-show="camStates[idx]?.currentSegment" x-cloak>
-          <a :href="downloadUrl(idx)" download @click.stop title="Download segment">&#11015;</a>
+          <a :href="downloadUrl(idx)" download @click.stop title="Download segment">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+          </a>
         </div>
         <video :id="'video-' + idx"
                preload="auto"
