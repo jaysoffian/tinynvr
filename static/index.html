@@ -374,23 +374,12 @@ html, body {
   color: var(--text-dim);
   margin-top: 2px;
 }
-.fs-scrub-row {
+.fs-download-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  margin-bottom: 4px;
 }
-.fs-scrub-row button {
-  background: rgba(255,255,255,0.15);
-  border: none;
-  color: var(--text);
-  border-radius: 4px;
-  padding: 4px 10px;
-  font-size: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.fs-scrub-row button:hover { background: rgba(255,255,255,0.25); }
-.fs-scrub-row .fs-download {
+.fs-download-row .fs-download {
   color: var(--text);
   background: rgba(0,0,0,0.6);
   border-radius: 6px;
@@ -398,9 +387,24 @@ html, body {
   font-size: 18px;
   text-decoration: none;
   opacity: 0.8;
-  flex-shrink: 0;
 }
-.fs-scrub-row .fs-download:hover { opacity: 1; }
+.fs-download-row .fs-download:hover { opacity: 1; }
+.fs-scrub-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fs-scrub-row .fs-play {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 0 4px;
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+.fs-scrub-row .fs-play:hover { opacity: 1; }
 .fs-scrub-row select {
   background: rgba(255,255,255,0.15);
   color: var(--text);
@@ -518,16 +522,12 @@ html, body {
               <span class="fs-time-value" x-text="currentTimeDisplay"></span>
               <div class="fs-date-value" x-text="currentDateDisplay"></div>
             </div>
-            <div class="fs-scrub-row">
+            <div class="fs-download-row">
               <a class="fs-download" x-show="camStates[idx]?.currentSegment"
                  :href="downloadUrl(idx)" download @click.stop title="Download">&#11015;</a>
-              <button @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
-              <select x-model.number="playbackSpeed" @change="applySpeed()">
-                <option value="1">1x</option>
-                <option value="2">2x</option>
-                <option value="4">4x</option>
-                <option value="8">8x</option>
-              </select>
+            </div>
+            <div class="fs-scrub-row">
+              <button class="fs-play" @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
               <div class="fs-timeline">
               <div class="fs-timeline-bar">
                 <template x-for="seg in (segments[cam.name] || [])" :key="'fs-'+seg.filename">
@@ -543,6 +543,12 @@ html, body {
                    @touchmove.window="doFsScrub($event.touches[0])"
                    @touchend.window="endFsScrub()">
               </div>
+              <select x-model.number="playbackSpeed" @change="applySpeed()">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+                <option value="8">8x</option>
+              </select>
             </div>
             </div>
           </div>
