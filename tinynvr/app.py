@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
 from tinynvr.config import (
     Config,
@@ -218,17 +218,25 @@ async def serve_segment(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
 
-    if proc.returncode != 0:
-        error = stderr.decode(errors="replace").strip()
-        logger.warning("Remux failed for %s: %s", file_path, error)
-        raise HTTPException(status_code=500, detail="Failed to remux segment")
+    async def _stream() -> AsyncGenerator[bytes]:
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = await proc.stdout.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            # Kill ffmpeg immediately when client disconnects or we're done
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
     mp4_name = filename.replace(".mkv", ".mp4")
     disposition = "attachment" if download else "inline"
-    return Response(
-        content=stdout,
+    return StreamingResponse(
+        _stream(),
         media_type="video/mp4",
         headers={"Content-Disposition": f'{disposition}; filename="{mp4_name}"'},
     )
