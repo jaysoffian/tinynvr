@@ -529,6 +529,12 @@ html, body {
             </div>
             <div class="fs-scrub-row">
               <button class="fs-play" @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
+              <select x-model.number="playbackSpeed" @change="applySpeed()">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+                <option value="8">8x</option>
+              </select>
               <div class="fs-timeline">
               <div class="fs-timeline-bar">
                 <template x-for="seg in (segments[cam.name] || [])" :key="'fs-'+seg.filename">
@@ -545,12 +551,6 @@ html, body {
                    @touchend.window="endFsScrub()">
               </div>
             </div>
-              <select x-model.number="playbackSpeed" @change="applySpeed()">
-                <option value="1">1x</option>
-                <option value="2">2x</option>
-                <option value="4">4x</option>
-                <option value="8">8x</option>
-              </select>
             </div>
           </div>
         </div>
