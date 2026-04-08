@@ -181,7 +181,6 @@ class CameraRecorder:
         """Return status info for this camera."""
         return {
             "name": self.name,
-            "url": self.camera.url,
             "enabled": self.camera.enabled,
             "state": self.state,
             "last_error": self.last_error,

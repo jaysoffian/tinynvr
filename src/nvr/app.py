@@ -193,7 +193,10 @@ async def serve_segment(
 
 @app.post("/api/webhook")
 async def webhook(request: Request) -> dict:
-    """Toggle cameras by name. Body: {"cameras": ["name1", ...], "enabled": true}."""
+    """Toggle cameras by name.
+
+    Body: {"cameras": ["name1", ...], "enabled": true|false}
+    """
     body = await request.json()
     camera_names: list[str] = body.get("cameras", [])
     enabled: bool = body.get("enabled", False)
