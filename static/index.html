@@ -402,6 +402,21 @@ html, body {
   gap: 6px;
   flex-shrink: 0;
 }
+.fs-mute {
+  background: none;
+  border: none;
+  color: var(--text);
+  opacity: 0.7;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+}
+.fs-mute:hover { opacity: 1; }
+.fs-mute svg { width: 20px; height: 20px; }
 .fs-download {
   color: var(--text);
   text-decoration: none;
@@ -593,7 +608,7 @@ html, body {
             </div>
             <div class="fs-scrub-row">
               <div class="fs-left-controls">
-                <button class="fs-download" @click.stop="toggleMute(idx)" :title="unmutedIdx === idx ? 'Mute' : 'Unmute'">
+                <button class="fs-mute" @click.stop="toggleMute(idx)" :title="unmutedIdx === idx ? 'Mute' : 'Unmute'">
                   <svg x-show="unmutedIdx === idx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
                     <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
