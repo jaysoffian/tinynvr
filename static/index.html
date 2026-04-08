@@ -960,9 +960,12 @@ function nvr() {
       const segStart = this._parseStart(state.currentSegment).getTime();
       const computed = segStart + video.currentTime * 1000;
 
-      // After a manual seek, wait until the video has converged to the target
+      // After a manual seek, wait until the video has moved away from its
+      // pre-seek position (i.e. it's no longer reporting stale currentTime).
+      // Keyframes can be several seconds apart, so we just check that the
+      // video isn't still at the position it was before the seek.
       if (this._seekTarget) {
-        if (Math.abs(computed - this._seekTarget) > 500) return;
+        if (Math.abs(computed - this._seekTarget) > 5000) return;
         this._seekTarget = null;
       }
 
