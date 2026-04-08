@@ -44,7 +44,6 @@ html, body {
   height: 48px;
   flex-shrink: 0;
 }
-.topbar h1 { font-size: 18px; font-weight: 600; letter-spacing: 1px; }
 /* Week day picker */
 .week-picker {
   display: flex;
@@ -165,9 +164,6 @@ html, body {
   top: 0;
   left: 0;
   right: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
   padding: 6px 10px;
   background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
   z-index: 2;
@@ -178,12 +174,6 @@ html, body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
-}
-.panel-header .status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
 }
 .panel-actions {
   position: absolute;
@@ -323,6 +313,124 @@ html, body {
   z-index: 4;
 }
 
+/* Fullscreen overlay controls */
+.fs-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.fs-overlay > * { pointer-events: auto; }
+.fs-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+}
+.fs-top .fs-cam-name {
+  font-size: 15px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.fs-top .fs-close {
+  background: rgba(255,255,255,0.15);
+  border: none;
+  color: var(--text);
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.fs-top .fs-close:hover { background: rgba(255,255,255,0.25); }
+.fs-bottom {
+  background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+  padding: 24px 16px 12px;
+}
+.fs-time {
+  text-align: center;
+  margin-bottom: 8px;
+}
+.fs-time .fs-time-value {
+  font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 18px;
+  color: var(--text);
+}
+.fs-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.fs-controls button, .fs-controls a {
+  background: rgba(255,255,255,0.15);
+  border: none;
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 14px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.fs-controls button:hover, .fs-controls a:hover { background: rgba(255,255,255,0.25); }
+.fs-controls select {
+  background: rgba(255,255,255,0.15);
+  color: var(--text);
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.fs-controls .spacer { flex: 1; }
+.fs-timeline {
+  position: relative;
+  height: 24px;
+}
+.fs-timeline-bar {
+  position: absolute;
+  top: 8px;
+  left: 0;
+  right: 0;
+  height: 8px;
+  background: rgba(255,255,255,0.1);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.fs-timeline-segment {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: var(--segment-color);
+  border-radius: 2px;
+}
+.fs-timeline-cursor {
+  position: absolute;
+  top: 4px;
+  width: 2px;
+  height: 16px;
+  background: #fff;
+  border-radius: 1px;
+  transform: translateX(-1px);
+  pointer-events: none;
+}
+.fs-timeline-click {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+}
+
 /* Layout shell */
 .app-shell {
   display: flex;
@@ -336,7 +444,6 @@ html, body {
 
   <!-- Top bar -->
   <div class="topbar">
-    <h1>NVR</h1>
     <div class="week-picker">
       <button class="wp-arrow" @click="weekOffset--; buildWeek()">&lsaquo;</button>
       <template x-for="day in weekDays" :key="day.iso">
@@ -365,11 +472,8 @@ html, body {
     <template x-for="(cam, idx) in cameras" :key="cam.name">
       <div class="video-panel"
            :class="{'fullscreen-panel': fullscreenIdx === idx}"
-           @click="toggleFullscreen(idx)">
+           @click="fullscreenIdx === null && toggleFullscreen(idx)">
         <div class="panel-header">
-          <span class="status-dot"
-                :style="{background: cam.status === 'recording' ? 'var(--green)' : cam.status === 'error' ? 'var(--red)' : 'var(--gray)'}">
-          </span>
           <span class="cam-name" x-text="cam.name"></span>
         </div>
         <div class="panel-actions" x-show="camStates[idx]?.currentSegment" x-cloak>
@@ -385,6 +489,46 @@ html, body {
              x-show="!camStates[idx]?.currentSegment"
              x-cloak>
           <span>No recording</span>
+        </div>
+        <!-- Fullscreen overlay with controls + timeline -->
+        <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
+          <div class="fs-top">
+            <span class="fs-cam-name" x-text="cam.name"></span>
+            <button class="fs-close" @click="fullscreenIdx = null">&times;</button>
+          </div>
+          <div class="fs-bottom">
+            <div class="fs-time">
+              <span class="fs-time-value" x-text="currentTimeDisplay"></span>
+            </div>
+            <div class="fs-controls">
+              <button @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
+              <select x-model.number="playbackSpeed" @change="applySpeed()">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+                <option value="8">8x</option>
+              </select>
+              <div class="spacer"></div>
+              <a x-show="camStates[idx]?.currentSegment"
+                 :href="downloadUrl(idx)" download title="Download">&#8615;</a>
+            </div>
+            <div class="fs-timeline">
+              <div class="fs-timeline-bar">
+                <template x-for="seg in (segments[cam.name] || [])" :key="'fs-'+seg.filename">
+                  <div class="fs-timeline-segment" :style="segmentBlockStyle(seg)"></div>
+                </template>
+              </div>
+              <div class="fs-timeline-cursor" :style="'left:' + cursorPercent + '%'"></div>
+              <div class="fs-timeline-click"
+                   @mousedown.prevent="startFsScrub($event)"
+                   @mousemove.window="doFsScrub($event)"
+                   @mouseup.window="endFsScrub()"
+                   @touchstart.prevent="startFsScrub($event)"
+                   @touchmove.window="doFsScrub($event.touches[0])"
+                   @touchend.window="endFsScrub()">
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </template>
@@ -913,7 +1057,40 @@ function nvr() {
       const pct = x / rect.width;
       const seconds = pct * SECONDS_PER_DAY;
       this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
-      // During scrub, update segment selection for visual feedback
+      this.loadSegmentsForAll();
+    },
+
+    // -- Fullscreen scrubbing --
+
+    _fsScrubbing: false,
+    _fsScrubEl: null,
+
+    startFsScrub(e) {
+      this._fsScrubbing = true;
+      this._fsScrubEl = e.currentTarget;
+      const point = e.touches ? e.touches[0] : e;
+      this._fsScrubToPoint(point);
+    },
+
+    doFsScrub(e) {
+      if (!this._fsScrubbing) return;
+      this._fsScrubToPoint(e);
+    },
+
+    endFsScrub() {
+      if (!this._fsScrubbing) return;
+      this._fsScrubbing = false;
+      this._fsScrubEl = null;
+      this.loadSegmentsForAll();
+    },
+
+    _fsScrubToPoint(e) {
+      if (!this._fsScrubEl) return;
+      const rect = this._fsScrubEl.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      const seconds = pct * SECONDS_PER_DAY;
+      this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
       this.loadSegmentsForAll();
     },
   };
