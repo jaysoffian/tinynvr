@@ -167,6 +167,7 @@ async def serve_segment(
     camera_name: str,
     filename: str,
     request: Request,
+    download: bool = False,
 ) -> Response:
     """Serve a segment by remuxing MKV to fMP4 for browser playback."""
     config: Config = request.app.state.config
@@ -204,10 +205,11 @@ async def serve_segment(
         raise HTTPException(status_code=500, detail="Failed to remux segment")
 
     mp4_name = filename.replace(".mkv", ".mp4")
+    disposition = "attachment" if download else "inline"
     return Response(
         content=stdout,
         media_type="video/mp4",
-        headers={"Content-Disposition": f'inline; filename="{mp4_name}"'},
+        headers={"Content-Disposition": f'{disposition}; filename="{mp4_name}"'},
     )
 
 
@@ -216,36 +218,32 @@ async def serve_segment(
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/webhook")
-async def webhook(request: Request) -> dict:
-    """Toggle cameras by name.
+@app.post("/api/webhook/{name}")
+async def webhook(name: str, request: Request) -> dict:
+    """Toggle a camera on or off.
 
-    Body: {"cameras": ["name1", ...], "enabled": true|false}
+    Body: {"enabled": true|false}
     """
-    body = await request.json()
-    camera_names: list[str] = body.get("cameras", [])
-    enabled: bool = body.get("enabled", False)
     manager: RecordingManager = request.app.state.manager
+    if name not in manager.recorders:
+        raise HTTPException(status_code=404, detail=f"Camera '{name}' not found")
+
+    body = await request.json()
+    enabled: bool = body.get("enabled", False)
+
     config: Config = request.app.state.config
+    config.cameras[name].enabled = enabled
+    if enabled:
+        await manager.recorders[name].start()
+    else:
+        await manager.recorders[name].stop()
 
-    affected = []
-    for name in camera_names:
-        if name not in manager.recorders:
-            continue
-        affected.append(name)
-        config.cameras[name].enabled = enabled
-        if enabled:
-            await manager.recorders[name].start()
-        else:
-            await manager.recorders[name].stop()
-
-    if affected:
-        save_config(config)
+    save_config(config)
 
     action = "enabled" if enabled else "disabled"
-    logger.info("Webhook: %s cameras: %s", action, affected)
+    logger.info("Webhook: %s camera %s", action, name)
 
-    return {"status": "ok", "action": action, "cameras": affected}
+    return {"status": "ok", "action": action, "camera": name}
 
 
 # ---------------------------------------------------------------------------

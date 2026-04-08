@@ -85,8 +85,8 @@ html, body {
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  grid-template-rows: 1fr 1fr;
+  grid-template-columns: repeat(var(--grid-cols, 2), 1fr);
+  grid-auto-rows: 1fr;
   gap: 2px;
   padding: 2px;
   min-height: 0;
@@ -140,6 +140,28 @@ html, body {
   border-radius: 50%;
   flex-shrink: 0;
 }
+.panel-actions {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  gap: 4px;
+  pointer-events: auto;
+}
+.panel-actions a {
+  color: var(--text);
+  background: rgba(0,0,0,0.5);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.video-panel:hover .panel-actions a { opacity: 0.7; }
+.panel-actions a:hover { opacity: 1 !important; }
+
 .no-recording-overlay {
   position: absolute;
   inset: 0;
@@ -283,7 +305,7 @@ html, body {
   </div>
 
   <!-- Video grid -->
-  <div class="main">
+  <div class="main" :style="'--grid-cols:' + gridColumns">
     <template x-for="(cam, idx) in cameras" :key="cam.name">
       <div class="video-panel"
            :class="{'fullscreen-panel': fullscreenIdx === idx}"
@@ -293,6 +315,9 @@ html, body {
                 :style="{background: cam.status === 'recording' ? 'var(--green)' : cam.status === 'error' ? 'var(--red)' : 'var(--gray)'}">
           </span>
           <span class="cam-name" x-text="cam.name"></span>
+        </div>
+        <div class="panel-actions" x-show="camStates[idx]?.currentSegment" x-cloak>
+          <a :href="downloadUrl(idx)" download @click.stop title="Download segment">&#11015;</a>
         </div>
         <video :id="'video-' + idx"
                preload="auto"
@@ -373,6 +398,7 @@ function nvr() {
     fullscreenIdx: null,
     scrubbing: false,
     animFrameId: null,
+    gridColumns: 2,
 
     get currentTimeDisplay() {
       if (!this.wallTime) return '--:--:--';
@@ -393,11 +419,22 @@ function nvr() {
     },
 
     async init() {
+      await this.fetchConfig();
       await this.fetchCameras();
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       await this.fetchAllSegments();
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
+    },
+
+    async fetchConfig() {
+      try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        this.gridColumns = cfg.display?.grid_columns || 2;
+      } catch (e) {
+        console.error('Failed to fetch config:', e);
+      }
     },
 
     _pickInitialWallTime() {
@@ -513,6 +550,13 @@ function nvr() {
 
     segmentUrl(camName, seg) {
       return `/api/segments/${encodeURIComponent(camName)}/${seg.filename}`;
+    },
+
+    downloadUrl(idx) {
+      const cam = this.cameras[idx];
+      const state = this.camStates[idx];
+      if (!cam || !state?.currentSegment) return '#';
+      return this.segmentUrl(cam.name, state.currentSegment) + '?download=1';
     },
 
     getVideo(idx) {

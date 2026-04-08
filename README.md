@@ -47,18 +47,18 @@ cameras:
 
 ## HomeAssistant webhook
 
-POST to `/api/webhook` to toggle cameras on or off by name:
+POST to `/api/webhook/{camera_name}` to toggle a camera on or off:
 
 ```bash
-# Disable specific cameras
-curl -X POST http://nvr:8554/api/webhook \
+# Disable a camera
+curl -X POST http://nvr:8554/api/webhook/living-room \
   -H 'Content-Type: application/json' \
-  -d '{"cameras": ["living-room", "kitchen"], "enabled": false}'
+  -d '{"enabled": false}'
 
-# Re-enable them
-curl -X POST http://nvr:8554/api/webhook \
+# Re-enable it
+curl -X POST http://nvr:8554/api/webhook/living-room \
   -H 'Content-Type: application/json' \
-  -d '{"cameras": ["living-room", "kitchen"], "enabled": true}'
+  -d '{"enabled": true}'
 ```
 
 ## Docker
