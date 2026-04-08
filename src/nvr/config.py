@@ -6,11 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+from ruamel.yaml import YAML
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("NVR_CONFIG", "config.yaml"))
+
+_yaml = YAML()
+_yaml.preserve_quotes = True
 
 
 @dataclass
@@ -30,6 +33,8 @@ class CameraConfig:
 class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    _raw: Any = field(default=None, repr=False)
+    _path: Path | None = field(default=None, repr=False)
 
 
 def _parse_camera(data: dict[str, Any]) -> CameraConfig:
@@ -54,7 +59,7 @@ def load_config(path: Path | None = None) -> Config:
         logger.warning("Config file %s not found, using defaults", config_path)
         return Config()
 
-    raw = yaml.safe_load(config_path.read_text())
+    raw = _yaml.load(config_path)
     if not raw:
         return Config()
 
@@ -63,11 +68,11 @@ def load_config(path: Path | None = None) -> Config:
         name: _parse_camera(cam_data)
         for name, cam_data in raw.get("cameras", {}).items()
     }
-    return Config(storage=storage, cameras=cameras)
+    return Config(storage=storage, cameras=cameras, _raw=raw, _path=config_path)
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:
-    """Convert config dataclass to a plain dict suitable for YAML/JSON."""
+    """Convert config dataclass to a plain dict suitable for JSON."""
     return {
         "storage": {
             "path": config.storage.path,
@@ -84,9 +89,20 @@ def config_to_dict(config: Config) -> dict[str, Any]:
     }
 
 
-def save_config(config: Config, path: Path | None = None) -> None:
-    """Write configuration back to YAML file."""
-    config_path = path or CONFIG_PATH
-    data = config_to_dict(config)
-    config_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+def save_config(config: Config) -> None:
+    """Write configuration back to YAML, preserving comments and formatting."""
+    config_path = config._path or CONFIG_PATH
+    raw = config._raw
+
+    if raw is not None:
+        # Update the raw ruamel structure in-place to preserve comments
+        cameras_raw = raw.get("cameras", {})
+        for name, cam in config.cameras.items():
+            if name in cameras_raw:
+                cameras_raw[name]["enabled"] = cam.enabled
+    else:
+        raw = config_to_dict(config)
+
+    with config_path.open("w") as f:
+        _yaml.dump(raw, f)
     logger.info("Config saved to %s", config_path)

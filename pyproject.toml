@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "fastapi",
-    "pyyaml",
+    "ruamel-yaml>=0.19.1",
     "uvicorn[standard]",
 ]
 
