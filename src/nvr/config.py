@@ -24,11 +24,6 @@ class StorageConfig:
 
 
 @dataclass
-class DisplayConfig:
-    grid_columns: int = 2
-
-
-@dataclass
 class CameraConfig:
     url: str = ""
     enabled: bool = True
@@ -37,7 +32,6 @@ class CameraConfig:
 @dataclass
 class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
-    display: DisplayConfig = field(default_factory=DisplayConfig)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     _raw: Any = field(default=None, repr=False)
     _path: Path | None = field(default=None, repr=False)
@@ -47,12 +41,6 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
     return CameraConfig(
         url=data.get("url", ""),
         enabled=data.get("enabled", True),
-    )
-
-
-def _parse_display(data: dict[str, Any]) -> DisplayConfig:
-    return DisplayConfig(
-        grid_columns=data.get("grid_columns", 2),
     )
 
 
@@ -76,14 +64,11 @@ def load_config(path: Path | None = None) -> Config:
         return Config()
 
     storage = _parse_storage(raw.get("storage", {}))
-    display = _parse_display(raw.get("display", {}))
     cameras = {
         name: _parse_camera(cam_data)
         for name, cam_data in raw.get("cameras", {}).items()
     }
-    return Config(
-        storage=storage, display=display, cameras=cameras, _raw=raw, _path=config_path
-    )
+    return Config(storage=storage, cameras=cameras, _raw=raw, _path=config_path)
 
 
 def config_to_dict(config: Config) -> dict[str, Any]:
@@ -93,9 +78,6 @@ def config_to_dict(config: Config) -> dict[str, Any]:
             "path": config.storage.path,
             "retention_days": config.storage.retention_days,
             "segment_minutes": config.storage.segment_minutes,
-        },
-        "display": {
-            "grid_columns": config.display.grid_columns,
         },
         "cameras": {
             name: {

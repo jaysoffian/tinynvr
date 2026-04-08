@@ -3,9 +3,6 @@ storage:
   retention_days: 7
   segment_minutes: 5
 
-display:
-  grid_columns: 2  # number of columns in the video grid
-
 cameras:
   doorbell:
     url: "rtsp://host:8554/doorbell?mp4"

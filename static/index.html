@@ -598,7 +598,6 @@ function nvr() {
     fullscreenIdx: null,
     scrubbing: false,
     animFrameId: null,
-    gridColumns: 2,
     weekOffset: 0,
     weekDays: [],
 
@@ -643,24 +642,17 @@ function nvr() {
       this.weekDays = days;
     },
 
+    get gridColumns() {
+      return Math.ceil(Math.sqrt(this.cameras.length || 1));
+    },
+
     async init() {
       this.buildWeek();
-      await this.fetchConfig();
       await this.fetchCameras();
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       await this.fetchAllSegments();
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
-    },
-
-    async fetchConfig() {
-      try {
-        const res = await fetch('/api/config');
-        const cfg = await res.json();
-        this.gridColumns = cfg.display?.grid_columns || 2;
-      } catch (e) {
-        console.error('Failed to fetch config:', e);
-      }
     },
 
     _pickInitialWallTime() {
