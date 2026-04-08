@@ -189,8 +189,17 @@ html, body {
   left: 10px;
   z-index: 3;
   pointer-events: auto;
+  display: flex;
+  gap: 6px;
 }
-.panel-actions a {
+.panel-action-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.panel-actions a,
+.panel-actions .panel-action-btn {
   color: var(--text);
   text-decoration: none;
   opacity: 0;
@@ -199,12 +208,15 @@ html, body {
   align-items: center;
   justify-content: center;
 }
-.panel-actions a svg {
+.panel-actions a svg,
+.panel-actions .panel-action-btn svg {
   width: 20px;
   height: 20px;
 }
-.video-panel:hover .panel-actions a { opacity: 0.8; }
-.panel-actions a:hover { opacity: 1 !important; }
+.video-panel:hover .panel-actions a,
+.video-panel:hover .panel-actions .panel-action-btn { opacity: 0.8; }
+.panel-actions a:hover,
+.panel-actions .panel-action-btn:hover { opacity: 1 !important; }
 .video-panel.fullscreen-panel .panel-actions { display: none; }
 
 .no-recording-overlay {
@@ -538,6 +550,18 @@ html, body {
           <span class="cam-name" x-text="cam.name"></span>
         </div>
         <div class="panel-actions" x-show="camStates[idx]?.currentSegment" x-cloak>
+          <button class="panel-action-btn" @click.stop="toggleMute(idx)" :title="unmutedIdx === idx ? 'Mute' : 'Unmute'">
+            <svg x-show="unmutedIdx === idx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+            <svg x-show="unmutedIdx !== idx" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+              <line x1="23" y1="9" x2="17" y2="15"/>
+              <line x1="17" y1="9" x2="23" y2="15"/>
+            </svg>
+          </button>
           <a :href="downloadUrl(idx)" download @click.stop title="Download segment">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -675,6 +699,7 @@ function nvr() {
     playing: false,
     playbackSpeed: 1,
     fullscreenIdx: null,
+    unmutedIdx: null,
     scrubbing: false,
     _clockId: null,
     weekOffset: 0,
@@ -970,6 +995,7 @@ function nvr() {
       // replace the handler instead of accumulating stale listeners
       video.onloadedmetadata = () => {
         video.onloadedmetadata = null;
+        video.muted = this.unmutedIdx !== idx;
         this._seekVideo(video, seg);
         if (this.playing) {
           video.playbackRate = this.playbackSpeed;
@@ -1131,6 +1157,25 @@ function nvr() {
 
     toggleFullscreen(idx) {
       this.fullscreenIdx = this.fullscreenIdx === idx ? null : idx;
+    },
+
+    toggleMute(idx) {
+      if (this.unmutedIdx === idx) {
+        // Mute this camera
+        const video = this.getVideo(idx);
+        if (video) video.muted = true;
+        this.unmutedIdx = null;
+      } else {
+        // Mute previously unmuted camera
+        if (this.unmutedIdx !== null) {
+          const prev = this.getVideo(this.unmutedIdx);
+          if (prev) prev.muted = true;
+        }
+        // Unmute this camera
+        const video = this.getVideo(idx);
+        if (video) video.muted = false;
+        this.unmutedIdx = idx;
+      }
     },
 
     handleKey(e) {
