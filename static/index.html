@@ -498,8 +498,8 @@ html, body {
         <!-- Fullscreen overlay with controls + timeline -->
         <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
           <div class="fs-top">
-            <span class="fs-cam-name" x-text="cam.name"></span>
             <button class="fs-close" @click="fullscreenIdx = null">&times;</button>
+            <span class="fs-cam-name" x-text="cam.name"></span>
           </div>
           <div class="fs-bottom">
             <div class="fs-time">
