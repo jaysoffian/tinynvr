@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Lightweight self-hosted NVR. Records RTSP camera streams via ffmpeg
+TinyNVR — lightweight self-hosted NVR. Records RTSP camera streams via ffmpeg
 (no transcoding) and serves a web UI for synced multi-camera playback
 with timeline scrubbing. See [plan.md](plan.md) for full design.
 

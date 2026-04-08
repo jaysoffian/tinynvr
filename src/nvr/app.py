@@ -1,4 +1,4 @@
-"""FastAPI application for the NVR web interface."""
+"""FastAPI application for the TinyNVR web interface."""
 
 import asyncio
 import contextlib
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.manager = manager
 
     await manager.start_all()
-    logger.info("NVR started with %d camera(s)", len(config.cameras))
+    logger.info("TinyNVR started with %d camera(s)", len(config.cameras))
 
     yield
 
@@ -46,10 +46,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     retention_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await retention_task
-    logger.info("NVR shutdown complete")
+    logger.info("TinyNVR shutdown complete")
 
 
-app = FastAPI(title="NVR", lifespan=lifespan)
+app = FastAPI(title="TinyNVR", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

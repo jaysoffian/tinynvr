@@ -1,4 +1,4 @@
-"""Configuration loading and saving for NVR."""
+"""Configuration loading and saving for TinyNVR."""
 
 import logging
 import os

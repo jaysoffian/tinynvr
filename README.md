@@ -1,4 +1,4 @@
-# NVR
+# TinyNVR
 
 A lightweight, self-hosted NVR that records RTSP camera streams and provides a web UI for synced multi-camera playback with timeline scrubbing.
 
