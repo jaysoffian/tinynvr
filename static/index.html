@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVR</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+[x-cloak] { display: none !important; }
+
+:root {
+  --bg: #1a1a1a;
+  --panel: #2a2a2a;
+  --border: #3a3a3a;
+  --text: #e0e0e0;
+  --text-dim: #888;
+  --green: #4caf50;
+  --red: #e53935;
+  --gray: #666;
+  --accent: #5c9ce6;
+  --timeline-bg: #222;
+  --segment-color: #4caf50;
+  --timeline-label-width: 90px;
+  --timeline-right-pad: 12px;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+/* Top bar */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  height: 48px;
+  flex-shrink: 0;
+}
+.topbar h1 { font-size: 18px; font-weight: 600; letter-spacing: 1px; }
+.topbar input[type="date"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+  color-scheme: dark;
+}
+.topbar select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.topbar button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 16px;
+  cursor: pointer;
+  line-height: 1;
+}
+.topbar button:hover { background: var(--border); }
+.topbar .time-display {
+  font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 16px;
+  color: var(--accent);
+  min-width: 70px;
+}
+.topbar .spacer { flex: 1; }
+
+/* Main grid */
+.main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 2px;
+  padding: 2px;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.video-panel {
+  background: #000;
+  position: relative;
+  overflow: hidden;
+  border-radius: 2px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.video-panel.fullscreen-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  border-radius: 0;
+}
+.video-panel video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.video-panel .panel-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+  z-index: 2;
+  pointer-events: none;
+}
+.panel-header .cam-name {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.panel-header .status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.no-recording-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.6);
+  z-index: 1;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+/* Bottom timeline */
+.timeline-container {
+  flex-shrink: 0;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  padding: 6px 0 2px 0;
+  user-select: none;
+}
+.timeline-body {
+  position: relative;
+}
+.timeline-tracks {
+  margin-left: var(--timeline-label-width);
+  margin-right: var(--timeline-right-pad);
+}
+.timeline-track {
+  display: flex;
+  align-items: center;
+  height: 10px;
+  margin-bottom: 1px;
+  position: relative;
+}
+.timeline-track-label {
+  position: absolute;
+  left: calc(-1 * var(--timeline-label-width) + 2px);
+  width: calc(var(--timeline-label-width) - 6px);
+  text-align: right;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.timeline-track-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg);
+  position: relative;
+  border-radius: 1px;
+  overflow: hidden;
+}
+.timeline-segment-block {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: var(--segment-color);
+  border-radius: 1px;
+}
+
+/* Hour labels */
+.timeline-hours {
+  position: relative;
+  margin-left: var(--timeline-label-width);
+  margin-right: var(--timeline-right-pad);
+  height: 18px;
+}
+.timeline-hour-mark {
+  position: absolute;
+  top: 2px;
+  font-size: 9px;
+  color: var(--text-dim);
+  transform: translateX(-50%);
+}
+.timeline-hour-tick {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 3px;
+  background: var(--border);
+  transform: translateX(-50%);
+}
+
+/* Cursor region overlays the track+hours area with same margins */
+.timeline-cursor-region {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--timeline-label-width);
+  right: var(--timeline-right-pad);
+  pointer-events: none;
+  z-index: 5;
+}
+.timeline-cursor-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--red);
+  transform: translateX(-1px);
+}
+
+/* Click overlay for scrubbing - covers tracks + hours */
+.timeline-click-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--timeline-label-width);
+  right: var(--timeline-right-pad);
+  cursor: pointer;
+  z-index: 4;
+}
+
+/* Layout shell */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+</style>
+</head>
+<body>
+<div class="app-shell" x-data="nvr()" @keydown.window="handleKey($event)">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <h1>NVR</h1>
+    <input type="date" :value="selectedDate" @change="changeDate($event.target.value)">
+    <button @click="togglePlay" x-text="playing ? '&#9646;&#9646;' : '&#9654;'"></button>
+    <select x-model.number="playbackSpeed" @change="applySpeed()">
+      <option value="1">1x</option>
+      <option value="2">2x</option>
+      <option value="4">4x</option>
+      <option value="8">8x</option>
+    </select>
+    <span class="time-display" x-text="currentTimeDisplay"></span>
+    <div class="spacer"></div>
+  </div>
+
+  <!-- Video grid -->
+  <div class="main">
+    <template x-for="(cam, idx) in cameras" :key="cam.name">
+      <div class="video-panel"
+           :class="{'fullscreen-panel': fullscreenIdx === idx}"
+           @click="toggleFullscreen(idx)">
+        <div class="panel-header">
+          <span class="status-dot"
+                :style="{background: cam.status === 'recording' ? 'var(--green)' : cam.status === 'error' ? 'var(--red)' : 'var(--gray)'}">
+          </span>
+          <span class="cam-name" x-text="cam.name"></span>
+        </div>
+        <video :id="'video-' + idx"
+               preload="auto"
+               muted
+               playsinline
+               @timeupdate="idx === 0 && onPrimaryTimeUpdate($event)">
+        </video>
+        <div class="no-recording-overlay"
+             x-show="!camStates[idx]?.currentSegment"
+             x-cloak>
+          <span>No recording</span>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Timeline -->
+  <div class="timeline-container">
+    <div class="timeline-body" x-ref="timelineBody">
+      <!-- Segment tracks -->
+      <div class="timeline-tracks" x-ref="timelineTracks">
+        <template x-for="(cam, idx) in cameras" :key="'track-'+cam.name">
+          <div class="timeline-track">
+            <span class="timeline-track-label" x-text="cam.name"></span>
+            <div class="timeline-track-bar">
+              <template x-for="seg in (segments[cam.name] || [])" :key="seg.filename">
+                <div class="timeline-segment-block"
+                     :style="segmentBlockStyle(seg)"></div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+      <!-- Hour labels -->
+      <div class="timeline-hours">
+        <template x-for="h in 24" :key="h">
+          <span>
+            <span class="timeline-hour-tick" :style="'left:' + ((h-1)/24*100) + '%'"></span>
+            <span class="timeline-hour-mark"
+                  :style="'left:' + ((h-1)/24*100) + '%'"
+                  x-text="String(h-1).padStart(2,'0')"></span>
+          </span>
+        </template>
+      </div>
+      <!-- Cursor spanning entire timeline body -->
+      <div class="timeline-cursor-region">
+        <div class="timeline-cursor-line"
+             :style="'left:' + cursorPercent + '%'">
+        </div>
+      </div>
+      <!-- Invisible click overlay for scrubbing -->
+      <div class="timeline-click-overlay"
+           @mousedown.prevent="startScrub($event)"
+           @mousemove.window="doScrub($event)"
+           @mouseup.window="endScrub()"
+           @touchstart.prevent="startScrub($event)"
+           @touchmove.window="doScrub($event.touches[0])"
+           @touchend.window="endScrub()">
+      </div>
+    </div>
+  </div>
+</div>
+
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+<script>
+function nvr() {
+  const SEGMENT_DURATION = 300; // 5 minutes in seconds
+  const SECONDS_PER_DAY = 86400;
+
+  return {
+    cameras: [],
+    segments: {},       // { cameraName: [segment, ...] }
+    camStates: {},      // { idx: { currentSegment, nextSegment, loadedSrc } }
+    selectedDate: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
+    wallTime: null,     // Date object: the playback position in absolute time
+    playing: false,
+    playbackSpeed: 1,
+    fullscreenIdx: null,
+    scrubbing: false,
+    animFrameId: null,
+
+    get currentTimeDisplay() {
+      if (!this.wallTime) return '--:--:--';
+      const d = this.wallTime;
+      return [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map(n => String(n).padStart(2, '0')).join(':');
+    },
+
+    get cursorPercent() {
+      if (!this.wallTime) return 0;
+      const sod = this._startOfDay();
+      const diff = (this.wallTime - sod) / 1000;
+      return Math.max(0, Math.min(100, diff / SECONDS_PER_DAY * 100));
+    },
+
+    _startOfDay() {
+      return new Date(this.selectedDate + 'T00:00:00');
+    },
+
+    async init() {
+      await this.fetchCameras();
+      this.wallTime = new Date(this.selectedDate + 'T12:00:00');
+      await this.fetchAllSegments();
+      this._pickInitialWallTime();
+      this.loadSegmentsForAll();
+    },
+
+    _pickInitialWallTime() {
+      // Try to find the earliest segment across all cameras for today
+      let earliest = null;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name];
+        if (segs && segs.length > 0) {
+          const t = new Date(segs[0].start_time);
+          if (!earliest || t < earliest) earliest = t;
+        }
+      }
+      if (earliest) {
+        this.wallTime = earliest;
+      } else {
+        this.wallTime = new Date(this.selectedDate + 'T12:00:00');
+      }
+    },
+
+    async changeDate(newDate) {
+      this.pause();
+      this.selectedDate = newDate;
+      this.wallTime = new Date(newDate + 'T12:00:00');
+      await this.fetchAllSegments();
+      this._pickInitialWallTime();
+      this.loadSegmentsForAll();
+    },
+
+    async fetchCameras() {
+      try {
+        const res = await fetch('/api/cameras');
+        this.cameras = await res.json();
+        this.cameras.forEach((_, idx) => {
+          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null };
+        });
+      } catch (e) {
+        console.error('Failed to fetch cameras:', e);
+      }
+    },
+
+    _utcDatesForLocalDate() {
+      // A local date spans up to 2 UTC dates (e.g. EDT midnight = 04:00 UTC)
+      const localStart = this._startOfDay();
+      const localEnd = new Date(localStart.getTime() + SECONDS_PER_DAY * 1000 - 1);
+      const dates = new Set([
+        localStart.toISOString().slice(0, 10),
+        localEnd.toISOString().slice(0, 10),
+      ]);
+      return [...dates];
+    },
+
+    async fetchAllSegments() {
+      const utcDates = this._utcDatesForLocalDate();
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + SECONDS_PER_DAY * 1000;
+
+      const results = await Promise.allSettled(
+        this.cameras.map(async cam => {
+          const allSegs = [];
+          for (const utcDate of utcDates) {
+            const res = await fetch(
+              `/api/cameras/${encodeURIComponent(cam.name)}/segments?date_str=${utcDate}`
+            );
+            const segs = await res.json();
+            allSegs.push(...segs);
+          }
+          // Keep only segments whose start falls within the local date
+          const filtered = allSegs.filter(seg => {
+            const t = new Date(seg.start_time).getTime();
+            return t >= dayStart && t < dayEnd;
+          });
+          filtered.sort((a, b) => a.start_time.localeCompare(b.start_time));
+          return { name: cam.name, segs: filtered };
+        })
+      );
+      const fresh = {};
+      for (const r of results) {
+        if (r.status === 'fulfilled') {
+          fresh[r.value.name] = r.value.segs;
+        }
+      }
+      for (const cam of this.cameras) {
+        if (!(cam.name in fresh)) fresh[cam.name] = [];
+      }
+      this.segments = fresh;
+    },
+
+    _parseStart(seg) {
+      return new Date(seg.start_time);
+    },
+
+    findSegmentAt(camName, time) {
+      const segs = this.segments[camName] || [];
+      const t = time.getTime();
+      for (let i = 0; i < segs.length; i++) {
+        const start = this._parseStart(segs[i]).getTime();
+        const end = start + SEGMENT_DURATION * 1000;
+        if (t >= start && t < end) {
+          return { segment: segs[i], index: i };
+        }
+      }
+      return null;
+    },
+
+    findNextSegment(camName, currentSeg) {
+      const segs = this.segments[camName] || [];
+      const idx = segs.indexOf(currentSeg);
+      if (idx >= 0 && idx < segs.length - 1) {
+        return segs[idx + 1];
+      }
+      return null;
+    },
+
+    segmentUrl(camName, seg) {
+      return `/api/segments/${encodeURIComponent(camName)}/${seg.filename}`;
+    },
+
+    getVideo(idx) {
+      return document.getElementById('video-' + idx);
+    },
+
+    loadSegmentsForAll() {
+      this.cameras.forEach((_, idx) => this.loadSegmentForCamera(idx));
+    },
+
+    loadSegmentForCamera(idx) {
+      const cam = this.cameras[idx];
+      const video = this.getVideo(idx);
+      if (!video || !cam) return;
+
+      const found = this.findSegmentAt(cam.name, this.wallTime);
+      const state = this.camStates[idx];
+
+      if (!found) {
+        if (state) {
+          state.currentSegment = null;
+          state.nextSegment = null;
+          state.loadedSrc = null;
+        }
+        video.removeAttribute('src');
+        video.load();
+        return;
+      }
+
+      const seg = found.segment;
+      const next = this.findNextSegment(cam.name, seg);
+      const url = this.segmentUrl(cam.name, seg);
+
+      // Only reload video source if the segment actually changed
+      if (state && state.loadedSrc === url) {
+        state.currentSegment = seg;
+        state.nextSegment = next;
+        this._seekVideo(video, seg);
+        return;
+      }
+
+      if (state) {
+        state.currentSegment = seg;
+        state.nextSegment = next;
+        state.loadedSrc = url;
+      }
+
+      video.src = url;
+
+      const onReady = () => {
+        this._seekVideo(video, seg);
+        if (this.playing) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
+        }
+      };
+
+      // Use loadedmetadata if we need it, but also handle if already loaded
+      if (video.readyState >= 1) {
+        onReady();
+      } else {
+        video.addEventListener('loadedmetadata', onReady, { once: true });
+      }
+
+      // Handle segment end: load next
+      video.onended = () => this._onSegmentEnd(idx);
+    },
+
+    _seekVideo(video, seg) {
+      if (!video || !seg || !this.wallTime) return;
+      const segStart = this._parseStart(seg).getTime();
+      const offset = (this.wallTime.getTime() - segStart) / 1000;
+      const dur = isNaN(video.duration) ? SEGMENT_DURATION : video.duration;
+      const target = Math.max(0, Math.min(offset, dur));
+      if (Math.abs(video.currentTime - target) > 0.5) {
+        video.currentTime = target;
+      }
+    },
+
+    onPrimaryTimeUpdate(event) {
+      if (!this.playing || this.scrubbing) return;
+      const video = event.target;
+      const state = this.camStates[0];
+      if (!state || !state.currentSegment) return;
+
+      const segStart = this._parseStart(state.currentSegment).getTime();
+      this.wallTime = new Date(segStart + video.currentTime * 1000);
+
+      // Sync non-primary cameras
+      for (let i = 1; i < this.cameras.length; i++) {
+        const cs = this.camStates[i];
+        if (!cs) continue;
+
+        if (!cs.currentSegment) {
+          // Maybe a segment appeared at the current wallTime
+          const found = this.findSegmentAt(this.cameras[i].name, this.wallTime);
+          if (found) this.loadSegmentForCamera(i);
+        } else {
+          // Check if we've drifted into a different segment
+          const segEnd = this._parseStart(cs.currentSegment).getTime() + SEGMENT_DURATION * 1000;
+          if (this.wallTime.getTime() >= segEnd || this.wallTime.getTime() < this._parseStart(cs.currentSegment).getTime()) {
+            this.loadSegmentForCamera(i);
+          } else {
+            this._seekVideo(this.getVideo(i), cs.currentSegment);
+          }
+        }
+      }
+    },
+
+    _onSegmentEnd(idx) {
+      const state = this.camStates[idx];
+      if (!state) return;
+
+      if (!state.nextSegment) {
+        state.currentSegment = null;
+        state.loadedSrc = null;
+        // If primary ended with no next, start free-running
+        if (idx === 0 && this.playing) {
+          this.startFreeRunning();
+        }
+        return;
+      }
+
+      if (idx === 0) {
+        // Primary camera drives wallTime to next segment start
+        this.wallTime = this._parseStart(state.nextSegment);
+        this.loadSegmentsForAll();
+      } else {
+        this.loadSegmentForCamera(idx);
+      }
+    },
+
+    togglePlay() {
+      if (this.playing) {
+        this.pause();
+      } else {
+        this.play();
+      }
+    },
+
+    play() {
+      this.playing = true;
+      let hasPrimary = false;
+
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        const state = this.camStates[idx];
+        if (video && state?.currentSegment) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
+          if (idx === 0) hasPrimary = true;
+        }
+      });
+
+      // If primary camera has no segment, advance wallTime via requestAnimationFrame
+      if (!hasPrimary) {
+        this.startFreeRunning();
+      }
+    },
+
+    pause() {
+      this.playing = false;
+      this.stopFreeRunning();
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        if (video && !video.paused) video.pause();
+      });
+    },
+
+    startFreeRunning() {
+      this.stopFreeRunning();
+      let lastTick = performance.now();
+      const tick = (now) => {
+        if (!this.playing) return;
+        // If primary got a segment, stop free-running
+        if (this.camStates[0]?.currentSegment) {
+          this.animFrameId = null;
+          return;
+        }
+        const elapsed = (now - lastTick) / 1000 * this.playbackSpeed;
+        lastTick = now;
+        this.wallTime = new Date(this.wallTime.getTime() + elapsed * 1000);
+
+        // Check if any camera now has a segment
+        this.cameras.forEach((cam, idx) => {
+          if (!this.camStates[idx]?.currentSegment) {
+            const found = this.findSegmentAt(cam.name, this.wallTime);
+            if (found) this.loadSegmentForCamera(idx);
+          }
+        });
+        this.animFrameId = requestAnimationFrame(tick);
+      };
+      this.animFrameId = requestAnimationFrame(tick);
+    },
+
+    stopFreeRunning() {
+      if (this.animFrameId) {
+        cancelAnimationFrame(this.animFrameId);
+        this.animFrameId = null;
+      }
+    },
+
+    applySpeed() {
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        if (video) video.playbackRate = this.playbackSpeed;
+      });
+    },
+
+    toggleFullscreen(idx) {
+      this.fullscreenIdx = this.fullscreenIdx === idx ? null : idx;
+    },
+
+    handleKey(e) {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+      switch (e.code) {
+        case 'Space':
+          e.preventDefault();
+          this.togglePlay();
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          this.wallTime = new Date(this.wallTime.getTime() + 30000);
+          this.loadSegmentsForAll();
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          this.wallTime = new Date(this.wallTime.getTime() - 30000);
+          this.loadSegmentsForAll();
+          break;
+        case 'Escape':
+          this.fullscreenIdx = null;
+          break;
+      }
+    },
+
+    // -- Timeline --
+
+    segmentBlockStyle(seg) {
+      const start = this._parseStart(seg);
+      const sod = this._startOfDay();
+      const startSec = (start - sod) / 1000;
+      const left = startSec / SECONDS_PER_DAY * 100;
+      const width = SEGMENT_DURATION / SECONDS_PER_DAY * 100;
+      return `left:${left}%;width:${width}%`;
+    },
+
+    // -- Scrubbing --
+
+    startScrub(e) {
+      this.scrubbing = true;
+      const point = e.touches ? e.touches[0] : e;
+      this._scrubToPoint(point);
+    },
+
+    doScrub(e) {
+      if (!this.scrubbing) return;
+      this._scrubToPoint(e);
+    },
+
+    endScrub() {
+      if (!this.scrubbing) return;
+      this.scrubbing = false;
+      this.loadSegmentsForAll();
+    },
+
+    _scrubToPoint(e) {
+      const overlay = this.$refs.timelineBody?.querySelector('.timeline-click-overlay');
+      if (!overlay) return;
+      const rect = overlay.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      const seconds = pct * SECONDS_PER_DAY;
+      this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
+      // During scrub, update segment selection for visual feedback
+      this.loadSegmentsForAll();
+    },
+  };
+}
+</script>
+</body>
+</html>

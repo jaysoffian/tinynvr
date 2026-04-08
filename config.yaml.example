@@ -1,0 +1,18 @@
+storage:
+  path: ./recordings
+  retention_days: 7
+  segment_seconds: 300
+
+cameras:
+  doorbell:
+    url: "rtsp://host:8554/doorbell?mp4"
+    enabled: true
+  dining-room:
+    url: "rtsp://host:8554/dining-room?mp4"
+    enabled: true
+  family-room:
+    url: "rtsp://host:8554/family-room?mp4"
+    enabled: true
+  kitchen:
+    url: "rtsp://host:8554/kitchen?mp4"
+    enabled: true
