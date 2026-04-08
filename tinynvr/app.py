@@ -19,6 +19,7 @@ from tinynvr.config import (
     load_config,
     save_config,
 )
+from tinynvr.duration import ensure_durations
 from tinynvr.recorder import RecordingManager
 from tinynvr.retention import retention_loop
 
@@ -156,12 +157,19 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
         return []
 
     prefix = date_str + "_"
-    segments = []
+    paths = []
     for segment_path in sorted(camera_dir.iterdir()):
         if not segment_path.name.startswith(prefix):
             continue
         if segment_path.suffix != ".mkv" or not segment_path.is_file():
             continue
+        paths.append(segment_path)
+
+    # Read/backfill sidecar .dur files (probes missing ones in background)
+    durations = await ensure_durations(paths)
+
+    segments = []
+    for segment_path in paths:
         try:
             start_time = (
                 datetime.strptime(segment_path.stem, "%Y-%m-%d_%H-%M-%S")
@@ -176,6 +184,7 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
                 "filename": segment_path.name,
                 "start_time": start_time,
                 "size_bytes": segment_path.stat().st_size,
+                "duration_sec": durations.get(segment_path.name),
             }
         )
 

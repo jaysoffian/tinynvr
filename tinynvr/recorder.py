@@ -10,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from tinynvr.config import CameraConfig, Config, StorageConfig, save_config
+from tinynvr.duration import ensure_durations
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,18 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
+    async def _backfill_nfo(self) -> None:
+        """Write .nfo sidecars for any segments missing them."""
+        if not self.output_dir.is_dir():
+            return
+        missing = [
+            p
+            for p in self.output_dir.iterdir()
+            if p.suffix == ".mkv" and p.is_file() and not p.with_suffix(".nfo").exists()
+        ]
+        if missing:
+            await ensure_durations(missing)
+
     async def _kill_process(self) -> None:
         """Send SIGTERM, wait up to 5s, then SIGKILL."""
         if self._process is None or self._process.returncode is not None:
@@ -154,6 +167,9 @@ class CameraRecorder:
                     self.state = CameraState.ERROR
                 else:
                     logger.info("ffmpeg for %s exited cleanly", self.name)
+
+                # Write .nfo for any segments missing them
+                await self._backfill_nfo()
 
                 # Reset backoff if process ran successfully for >30s
                 if elapsed > 30:

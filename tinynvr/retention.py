@@ -34,6 +34,10 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
                 continue
             if file_date < cutoff:
                 segment.unlink()
+                # Also remove .nfo sidecar if present
+                nfo = segment.with_suffix(".nfo")
+                if nfo.exists():
+                    nfo.unlink()
                 deleted += 1
                 logger.debug("Deleted old segment: %s", segment)
 

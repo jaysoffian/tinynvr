@@ -850,10 +850,11 @@ function nvr() {
     },
 
     _segEnd(segs, i) {
-      // Use segment_minutes from config as the max duration.
-      // Actual duration is only known once the video loads (video.duration),
-      // but for segment lookup and timeline display this upper bound is fine.
-      return this._parseStart(segs[i]).getTime() + this._segmentDurationMs;
+      const start = this._parseStart(segs[i]).getTime();
+      if (segs[i].duration_sec != null) {
+        return start + segs[i].duration_sec * 1000;
+      }
+      return start + this._segmentDurationMs;
     },
 
     findSegmentAt(camName, time) {
@@ -965,7 +966,7 @@ function nvr() {
       if (!video || !seg || !this.wallTime) return;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
-      const dur = isNaN(video.duration) ? this._segmentDurationMs / 1000 : video.duration;
+      const dur = isNaN(video.duration) ? (seg.duration_sec || this._segmentDurationMs / 1000) : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
@@ -976,15 +977,17 @@ function nvr() {
       const state = this.camStates[idx];
       if (!state) return;
 
-      if (!state.nextSegment) {
-        state.currentSegment = null;
-        state.loadedSrc = null;
-        return;
-      }
-
       if (idx === 0) {
-        // Primary camera drives wallTime to next segment start
-        this.wallTime = this._parseStart(state.nextSegment);
+        // Jump wallTime forward to next segment if needed, but NEVER backward.
+        // A backward jump here is what caused the seek snap-back: short/corrupt
+        // segments end before wallTime, and the next segment starts earlier
+        // than where we seeked to.
+        if (state.nextSegment) {
+          const nextStart = this._parseStart(state.nextSegment);
+          if (nextStart > this.wallTime) {
+            this.wallTime = nextStart;
+          }
+        }
         this.loadSegmentsForAll();
       } else {
         this.loadSegmentForCamera(idx);
@@ -1135,7 +1138,7 @@ function nvr() {
       const sod = this._startOfDay();
       const startSec = (start - sod) / 1000;
       const left = startSec / SECONDS_PER_DAY * 100;
-      const durSec = this._segmentDurationMs / 1000;
+      const durSec = seg.duration_sec || this._segmentDurationMs / 1000;
       const width = durSec / SECONDS_PER_DAY * 100;
       return `left:${left}%;width:${width}%`;
     },
