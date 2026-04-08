@@ -749,6 +749,7 @@ function nvr() {
     unmutedIdx: null,
     scrubbing: false,
     _clockId: null,
+    _refreshId: null,
     weekOffset: 0,
     weekDays: [],
     earliestDate: null,
@@ -834,6 +835,26 @@ function nvr() {
       await this.fetchAllSegments();
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
+      this._startSegmentRefresh();
+    },
+
+    _isToday() {
+      const now = new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+      return this.selectedDate === today;
+    },
+
+    _startSegmentRefresh() {
+      this._stopSegmentRefresh();
+      if (!this._isToday()) return;
+      this._refreshId = setInterval(() => this.fetchAllSegments(), 60000);
+    },
+
+    _stopSegmentRefresh() {
+      if (this._refreshId) {
+        clearInterval(this._refreshId);
+        this._refreshId = null;
+      }
     },
 
     _pickInitialWallTime() {
@@ -860,6 +881,7 @@ function nvr() {
       await this.fetchAllSegments();
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
+      this._startSegmentRefresh();
     },
 
     async fetchCameras() {
