@@ -38,6 +38,7 @@ class CameraRecorder:
         self.last_error: str | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._sidecar_task: asyncio.Task | None = None
         self._should_run = False
         self._backoff = 1.0
 
@@ -84,10 +85,16 @@ class CameraRecorder:
         self._should_run = True
         self._backoff = 1.0
         self._monitor_task = asyncio.create_task(self._monitor())
+        self._sidecar_task = asyncio.create_task(self._sidecar_loop())
 
     async def stop(self) -> None:
         """Stop recording this camera."""
         self._should_run = False
+        if self._sidecar_task:
+            self._sidecar_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._sidecar_task
+            self._sidecar_task = None
         if self._monitor_task:
             self._monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -111,16 +118,25 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
-    def _existing_segments(self) -> set[Path]:
-        """Return the set of .mkv files currently in the output directory."""
-        if not self.output_dir.is_dir():
-            return set()
-        return {p for p in self.output_dir.iterdir() if p.suffix == ".mkv"}
-
-    async def _write_sidecars(self, paths: list[Path]) -> None:
-        """Write .json sidecars for the given segment files."""
-        if paths:
-            await ensure_durations(paths)
+    async def _sidecar_loop(self) -> None:
+        """Periodically write .json sidecars for completed segments."""
+        while True:
+            await asyncio.sleep(60)
+            if not self.output_dir.is_dir():
+                continue
+            all_mkv = sorted(
+                (p for p in self.output_dir.iterdir() if p.suffix == ".mkv"),
+                key=lambda p: p.name,
+            )
+            if not all_mkv:
+                continue
+            # Skip the newest file if we're actively recording —
+            # it's the one ffmpeg is currently writing to.
+            if self.state == CameraState.RECORDING:
+                all_mkv = all_mkv[:-1]
+            missing = [p for p in all_mkv if not p.with_suffix(".json").exists()]
+            if missing:
+                await ensure_durations(missing)
 
     async def _kill_process(self) -> None:
         """Send SIGTERM, wait up to 5s, then SIGKILL."""
@@ -144,7 +160,6 @@ class CameraRecorder:
         while self._should_run:
             start_time = time.monotonic()
             try:
-                before = self._existing_segments()
                 await self._spawn()
                 assert self._process is not None
                 stderr_data = await self._process.stderr.read()  # type: ignore[union-attr]
@@ -167,10 +182,6 @@ class CameraRecorder:
                     self.state = CameraState.ERROR
                 else:
                     logger.info("ffmpeg for %s exited cleanly", self.name)
-
-                # Write .json sidecars for segments created during this run
-                new_segments = sorted(self._existing_segments() - before)
-                await self._write_sidecars(new_segments)
 
                 # Reset backoff if process ran successfully for >30s
                 if elapsed > 30:
