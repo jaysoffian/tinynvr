@@ -405,17 +405,27 @@ html, body {
   text-align: center;
 }
 .fs-scrub-row .fs-play:hover { opacity: 1; }
+.fs-scrub-row select {
+  background: rgba(255,255,255,0.15);
+  color: var(--text);
+  border: none;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 11px;
+  flex-shrink: 0;
+  height: 20px;
+}
 .fs-timeline {
   position: relative;
-  height: 24px;
+  height: 20px;
   flex: 1;
 }
 .fs-timeline-bar {
   position: absolute;
-  top: 8px;
+  top: 4px;
   left: 0;
   right: 0;
-  height: 8px;
+  height: 12px;
   background: rgba(255,255,255,0.1);
   border-radius: 4px;
   overflow: hidden;
@@ -429,7 +439,7 @@ html, body {
 }
 .fs-timeline-cursor {
   position: absolute;
-  top: 4px;
+  top: 2px;
   width: 2px;
   height: 16px;
   background: #fff;
@@ -535,6 +545,12 @@ html, body {
                    @touchend.window="endFsScrub()">
               </div>
             </div>
+              <select x-model.number="playbackSpeed" @change="applySpeed()">
+                <option value="1">1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+                <option value="8">8x</option>
+              </select>
             </div>
           </div>
         </div>
