@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.config = config
     app.state.manager = manager
+    app.state.config_lock = asyncio.Lock()
 
     await manager.start_all()
     logger.info("TinyNVR started with %d camera(s)", len(config.cameras))
@@ -113,13 +115,14 @@ async def list_cameras(request: Request) -> list[dict]:
 async def enable_camera(name: str, request: Request) -> dict:
     """Enable a camera and start recording."""
     manager: RecordingManager = request.app.state.manager
-    try:
-        await manager.enable_camera(name)
-    except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Camera '{name}' not found",
-        ) from None
+    async with request.app.state.config_lock:
+        try:
+            await manager.enable_camera(name)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Camera '{name}' not found",
+            ) from None
     return manager.recorders[name].get_status()
 
 
@@ -127,13 +130,14 @@ async def enable_camera(name: str, request: Request) -> dict:
 async def disable_camera(name: str, request: Request) -> dict:
     """Disable a camera and stop recording."""
     manager: RecordingManager = request.app.state.manager
-    try:
-        await manager.disable_camera(name)
-    except KeyError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Camera '{name}' not found",
-        ) from None
+    async with request.app.state.config_lock:
+        try:
+            await manager.disable_camera(name)
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Camera '{name}' not found",
+            ) from None
     return manager.recorders[name].get_status()
 
 
@@ -264,12 +268,13 @@ async def serve_segment(
         logger.warning("Remux failed for %s: %s", file_path, error)
         raise HTTPException(status_code=500, detail="Failed to remux segment")
 
-    mp4_name = filename.replace(".mkv", ".mp4")
+    # Sanitize filename for Content-Disposition header
+    safe_name = re.sub(r"[^\w.\-]", "_", filename.replace(".mkv", ".mp4"))
     disposition = "attachment" if download else "inline"
     return Response(
         content=stdout,
         media_type="video/mp4",
-        headers={"Content-Disposition": f'{disposition}; filename="{mp4_name}"'},
+        headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'},
     )
 
 
@@ -289,16 +294,21 @@ async def webhook(name: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail=f"Camera '{name}' not found")
 
     body = await request.json()
-    enabled: bool = body.get("enabled", False)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="Body must contain 'enabled' as a boolean",
+        )
 
-    config: Config = request.app.state.config
-    config.cameras[name].enabled = enabled
-    if enabled:
-        await manager.recorders[name].start()
-    else:
-        await manager.recorders[name].stop()
-
-    save_config(config)
+    async with request.app.state.config_lock:
+        config: Config = request.app.state.config
+        config.cameras[name].enabled = enabled
+        if enabled:
+            await manager.recorders[name].start()
+        else:
+            await manager.recorders[name].stop()
+        save_config(config)
 
     action = "enabled" if enabled else "disabled"
     logger.info("Webhook: %s camera %s", action, name)
@@ -310,6 +320,6 @@ async def webhook(name: str, request: Request) -> dict:
 # Static files (must be last so API routes take priority)
 # ---------------------------------------------------------------------------
 
-static_dir = Path("static").resolve()
+static_dir = Path(__file__).resolve().parent.parent / "static"
 if static_dir.is_dir():
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
