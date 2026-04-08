@@ -1,6 +1,6 @@
-"""Sidecar .nfo files for segment metadata caching.
+"""Sidecar .json files for segment metadata caching.
 
-Each .mkv segment gets a .nfo JSON sidecar containing at minimum its
+Each .mkv segment gets a .json JSON sidecar containing at minimum its
 duration.  Written by the recorder when a segment completes, and
 backfilled by the server on first access for any missing ones.
 """
@@ -16,14 +16,14 @@ logger = logging.getLogger(__name__)
 _MAX_DURATION = 3600.0  # 1 hour sanity cap
 
 
-def nfo_path(mkv: Path) -> Path:
-    """Return the .nfo sidecar path for an MKV file."""
-    return mkv.with_suffix(".nfo")
+def sidecar_path(mkv: Path) -> Path:
+    """Return the .json sidecar path for an MKV file."""
+    return mkv.with_suffix(".json")
 
 
-def read_nfo(mkv: Path) -> dict[str, Any] | None:
+def read_sidecar(mkv: Path) -> dict[str, Any] | None:
     """Read sidecar metadata, or None if missing/invalid."""
-    p = nfo_path(mkv)
+    p = sidecar_path(mkv)
     if not p.exists():
         return None
     try:
@@ -34,7 +34,7 @@ def read_nfo(mkv: Path) -> dict[str, Any] | None:
 
 def read_duration(mkv: Path) -> float | None:
     """Read cached duration from sidecar, or None if missing."""
-    nfo = read_nfo(mkv)
+    nfo = read_sidecar(mkv)
     if nfo is None:
         return None
     dur = nfo.get("duration_sec")
@@ -44,7 +44,7 @@ def read_duration(mkv: Path) -> float | None:
 
 
 async def probe_and_write(mkv: Path) -> float | None:
-    """Probe duration with ffprobe and write .nfo sidecar. Returns seconds."""
+    """Probe duration with ffprobe and write .json sidecar. Returns seconds."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
@@ -66,7 +66,7 @@ async def probe_and_write(mkv: Path) -> float | None:
             return None
         dur = min(float(raw), _MAX_DURATION)
         nfo = {"duration_sec": round(dur, 3)}
-        nfo_path(mkv).write_text(json.dumps(nfo) + "\n")
+        sidecar_path(mkv).write_text(json.dumps(nfo) + "\n")
         return dur
     except TimeoutError, json.JSONDecodeError, ValueError, OSError:
         return None
@@ -75,7 +75,7 @@ async def probe_and_write(mkv: Path) -> float | None:
 async def ensure_durations(paths: list[Path]) -> dict[str, float]:
     """Return {filename: duration_sec} for all paths, probing any missing.
 
-    Reads from .nfo sidecars where available, probes with ffprobe otherwise.
+    Reads from .json sidecars where available, probes with ffprobe otherwise.
     Probes run concurrently with a concurrency limit.
     """
     results: dict[str, float] = {}

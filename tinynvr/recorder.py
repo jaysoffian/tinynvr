@@ -111,14 +111,16 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
-    async def _backfill_nfo(self) -> None:
-        """Write .nfo sidecars for any segments missing them."""
+    async def _backfill_sidecars(self) -> None:
+        """Write .json sidecars for any segments missing them."""
         if not self.output_dir.is_dir():
             return
         missing = [
             p
             for p in self.output_dir.iterdir()
-            if p.suffix == ".mkv" and p.is_file() and not p.with_suffix(".nfo").exists()
+            if p.suffix == ".mkv"
+            and p.is_file()
+            and not p.with_suffix(".json").exists()
         ]
         if missing:
             await ensure_durations(missing)
@@ -168,8 +170,8 @@ class CameraRecorder:
                 else:
                     logger.info("ffmpeg for %s exited cleanly", self.name)
 
-                # Write .nfo for any segments missing them
-                await self._backfill_nfo()
+                # Write .json for any segments missing them
+                await self._backfill_sidecars()
 
                 # Reset backoff if process ran successfully for >30s
                 if elapsed > 30:
