@@ -678,6 +678,7 @@ function nvr() {
     playbackSpeed: 1,
     fullscreenIdx: null,
     scrubbing: false,
+    seeking: false,
     animFrameId: null,
     weekOffset: 0,
     weekDays: [],
@@ -955,7 +956,7 @@ function nvr() {
     },
 
     onPrimaryTimeUpdate(event) {
-      if (!this.playing || this.scrubbing) return;
+      if (!this.playing || this.scrubbing || this.seeking) return;
       const video = event.target;
       const state = this.camStates[0];
       if (!state || !state.currentSegment) return;
@@ -1097,18 +1098,25 @@ function nvr() {
           break;
         case 'ArrowRight':
           e.preventDefault();
-          this.wallTime = new Date(this.wallTime.getTime() + 30000);
-          this.loadSegmentsForAll();
+          this._seekByKey(30000);
           break;
         case 'ArrowLeft':
           e.preventDefault();
-          this.wallTime = new Date(this.wallTime.getTime() - 30000);
-          this.loadSegmentsForAll();
+          this._seekByKey(-30000);
           break;
         case 'Escape':
           this.fullscreenIdx = null;
           break;
       }
+    },
+
+    _seekByKey(ms) {
+      this.seeking = true;
+      this.wallTime = new Date(this.wallTime.getTime() + ms);
+      this.loadSegmentsForAll();
+      // Clear seeking flag after videos have had time to seek
+      clearTimeout(this._seekTimer);
+      this._seekTimer = setTimeout(() => { this.seeking = false; }, 200);
     },
 
     // -- Timeline --
