@@ -196,6 +196,7 @@ html, body {
 }
 .video-panel:hover .panel-actions a { opacity: 0.8; }
 .panel-actions a:hover { opacity: 1 !important; }
+.video-panel.fullscreen-panel .panel-actions { z-index: 11; }
 
 .no-recording-overlay {
   position: absolute;
@@ -379,7 +380,7 @@ html, body {
   gap: 12px;
   margin-bottom: 6px;
 }
-.fs-controls button, .fs-controls a {
+.fs-controls button {
   background: rgba(255,255,255,0.15);
   border: none;
   color: var(--text);
@@ -387,9 +388,8 @@ html, body {
   padding: 4px 10px;
   font-size: 14px;
   cursor: pointer;
-  text-decoration: none;
 }
-.fs-controls button:hover, .fs-controls a:hover { background: rgba(255,255,255,0.25); }
+.fs-controls button:hover { background: rgba(255,255,255,0.25); }
 .fs-controls select {
   background: rgba(255,255,255,0.15);
   color: var(--text);
@@ -500,6 +500,7 @@ html, body {
           <div class="fs-top">
             <button class="fs-close" @click="fullscreenIdx = null">&times;</button>
             <span class="fs-cam-name" x-text="cam.name"></span>
+            <div class="spacer"></div>
           </div>
           <div class="fs-bottom">
             <div class="fs-time">
@@ -514,9 +515,6 @@ html, body {
                 <option value="4">4x</option>
                 <option value="8">8x</option>
               </select>
-              <div class="spacer"></div>
-              <a x-show="camStates[idx]?.currentSegment"
-                 :href="downloadUrl(idx)" download title="Download">&#8615;</a>
             </div>
             <div class="fs-timeline">
               <div class="fs-timeline-bar">
