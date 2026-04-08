@@ -227,6 +227,6 @@ async def webhook(request: Request) -> dict:
 # Static files (must be last so API routes take priority)
 # ---------------------------------------------------------------------------
 
-static_dir = Path("static")
+static_dir = Path("static").resolve()
 if static_dir.is_dir():
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
