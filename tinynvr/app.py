@@ -3,7 +3,9 @@
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -12,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 
 from tinynvr.config import (
     Config,
@@ -275,6 +277,155 @@ async def serve_segment(
         content=stdout,
         media_type="video/mp4",
         headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Range download API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/cameras/{name}/download")
+async def download_range(
+    name: str,
+    start: str,
+    end: str,
+    request: Request,
+) -> StreamingResponse:
+    """Download a time range as a single MP4 by concatenating segments."""
+    config: Config = request.app.state.config
+    if name not in config.cameras:
+        raise HTTPException(status_code=404, detail=f"Camera '{name}' not found")
+
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid datetime format, expected ISO 8601",
+        ) from None
+
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    storage = Path(config.storage.path).resolve()
+    camera_dir = storage / name
+    if not camera_dir.is_dir():
+        raise HTTPException(status_code=404, detail="No recordings found")
+
+    # Collect all MKV segments and parse their start times
+    all_segs: list[tuple[datetime, Path]] = []
+    for p in sorted(camera_dir.iterdir()):
+        if p.suffix != ".mkv" or not p.is_file():
+            continue
+        if not p.resolve().is_relative_to(storage):
+            continue
+        try:
+            ts = datetime.strptime(p.stem, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        all_segs.append((ts, p))
+
+    if not all_segs:
+        raise HTTPException(status_code=404, detail="No segments found")
+
+    dur_paths = [p for _, p in all_segs]
+    durations = await ensure_durations(dur_paths)
+
+    # Default segment duration from config (fallback)
+    default_dur = config.storage.segment_minutes * 60
+
+    # Find segments overlapping [start_dt, end_dt)
+    matching: list[tuple[datetime, Path, float]] = []
+    for ts, p in all_segs:
+        dur = durations.get(p.name) or default_dur
+        seg_end = ts.timestamp() + dur
+        if seg_end <= start_dt.timestamp():
+            continue
+        if ts.timestamp() >= end_dt.timestamp():
+            continue
+        matching.append((ts, p, dur))
+
+    if not matching:
+        raise HTTPException(
+            status_code=404,
+            detail="No segments overlap the requested range",
+        )
+
+    # Calculate trim offsets
+    first_start = matching[0][0].timestamp()
+    ss_offset = max(0.0, start_dt.timestamp() - first_start)
+
+    # Total duration of all concatenated segments
+    last_ts, _, last_dur = matching[-1]
+    concat_end = last_ts.timestamp() + last_dur
+    total_concat = concat_end - first_start
+    # Requested duration, clamped to available footage
+    requested_dur = end_dt.timestamp() - start_dt.timestamp()
+    trim_dur = min(requested_dur, total_concat - ss_offset)
+
+    # Build concat file list
+    concat_fd, concat_path_str = tempfile.mkstemp(suffix=".txt", prefix="nvr-concat-")
+    concat_file = Path(concat_path_str)
+    os.close(concat_fd)
+
+    with concat_file.open("w") as f:
+        for _, p, _ in matching:
+            f.write(f"file '{p}'\n")
+
+    # Build a descriptive filename
+    safe_start = re.sub(r"[^\w]", "-", start)
+    safe_end = re.sub(r"[^\w]", "-", end)
+    safe_name = re.sub(r"[^\w.\-]", "_", name)
+    filename = f"{safe_name}_{safe_start}_to_{safe_end}.mp4"
+
+    async def stream_ffmpeg() -> AsyncIterator[bytes]:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_path_str,
+            "-ss",
+            str(ss_offset),
+            "-t",
+            str(trim_dur),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            "-f",
+            "mp4",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+            await proc.wait()
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            concat_file.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        stream_ffmpeg(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

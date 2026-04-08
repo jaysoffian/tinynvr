@@ -439,14 +439,19 @@ html, body {
 .fs-download {
   color: var(--text);
   text-decoration: none;
+  background: none;
+  border: none;
   opacity: 0.7;
   display: flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
+  padding: 0;
+  cursor: pointer;
 }
-.fs-download:hover { opacity: 1; }
+.fs-download:hover:not(:disabled) { opacity: 1; }
+.fs-download:disabled { cursor: wait; }
 .fs-download svg { width: 20px; height: 20px; }
 .fs-speed {
   background: rgba(255,255,255,0.12);
@@ -532,6 +537,61 @@ html, body {
   inset: 0;
   cursor: pointer;
 }
+
+/* Selection highlight */
+.timeline-selection {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(92, 156, 230, 0.25);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Download bar */
+.selection-download-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px 4px var(--timeline-label-width);
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.selection-download-bar .sel-range {
+  font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  color: var(--text);
+  font-size: 12px;
+}
+.selection-download-bar .sel-dl-btn {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.selection-download-bar .sel-dl-btn:hover:not(:disabled) { background: var(--border); }
+.selection-download-bar .sel-dl-btn:disabled { opacity: 0.5; cursor: wait; }
+.selection-download-bar .sel-clear {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  line-height: 1;
+}
+.selection-download-bar .sel-clear:hover { color: var(--text); }
 
 /* Layout shell */
 .app-shell {
@@ -640,8 +700,21 @@ html, body {
             </div>
             <div class="fs-scrub-row">
               <div class="fs-left-controls">
-                <a class="fs-download" x-show="camStates[idx]?.currentSegment"
-                   :href="downloadUrl(idx)" download @click.stop title="Download">
+                <button class="fs-download"
+                        x-show="selectionStart && selectionEnd"
+                        x-cloak
+                        :disabled="downloadingCam"
+                        @click.stop="downloadRange(cam.name)"
+                        :title="downloadingCam === cam.name ? 'Preparing...' : 'Download selection'">
+                  <svg x-show="downloadingCam !== cam.name" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                  </svg>
+                  <span x-show="downloadingCam === cam.name" style="font-size:11px;">...</span>
+                </button>
+                <a class="fs-download" x-show="!selectionStart && camStates[idx]?.currentSegment"
+                   :href="downloadUrl(idx)" download @click.stop title="Download segment">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                     <polyline points="7 10 12 15 17 10"/>
@@ -667,9 +740,11 @@ html, body {
                   <div class="fs-timeline-segment" :style="segmentBlockStyle(seg)"></div>
                 </template>
               </div>
+              <div class="timeline-selection" x-show="selectionStart && selectionEnd" x-cloak
+                   :style="selectionStyle()"></div>
               <div class="fs-timeline-cursor" :style="'left:' + cursorPercent + '%'"></div>
               <div class="fs-timeline-click"
-                   @mousedown.prevent="startFsScrub($event)"
+                   @mousedown.prevent="startFsScrubOrSelect($event)"
                    @mousemove.window="doFsScrub($event)"
                    @mouseup.window="endFsScrub()"
                    @touchstart.prevent="startFsScrub($event)"
@@ -713,6 +788,12 @@ html, body {
           </span>
         </template>
       </div>
+      <!-- Selection highlight -->
+      <div class="timeline-cursor-region" style="pointer-events:none; z-index:3;"
+           x-show="selectionStart && selectionEnd" x-cloak>
+        <div class="timeline-selection"
+             :style="selectionStyle()"></div>
+      </div>
       <!-- Cursor spanning entire timeline body -->
       <div class="timeline-cursor-region">
         <div class="timeline-cursor-line"
@@ -721,7 +802,7 @@ html, body {
       </div>
       <!-- Invisible click overlay for scrubbing -->
       <div class="timeline-click-overlay"
-           @mousedown.prevent="startScrub($event)"
+           @mousedown.prevent="startScrubOrSelect($event)"
            @mousemove.window="doScrub($event)"
            @mouseup.window="endScrub()"
            @touchstart.prevent="startScrub($event)"
@@ -729,6 +810,22 @@ html, body {
            @touchend.window="endScrub()">
       </div>
     </div>
+  </div>
+
+  <!-- Selection download bar -->
+  <div class="selection-download-bar" x-show="selectionStart && selectionEnd" x-cloak>
+    <span class="sel-range" x-text="selectionRangeDisplay()"></span>
+    <template x-for="cam in cameras" :key="'dl-'+cam.name">
+      <button class="sel-dl-btn" :disabled="downloadingCam" @click="downloadRange(cam.name)">
+        <svg x-show="downloadingCam !== cam.name" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <span x-text="downloadingCam === cam.name ? 'Preparing...' : cam.name"></span>
+      </button>
+    </template>
+    <button class="sel-clear" @click="clearSelection()" title="Clear selection">&times;</button>
   </div>
 </div>
 
@@ -754,6 +851,9 @@ function nvr() {
     weekDays: [],
     earliestDate: null,
     canGoBack: true,
+    selectionStart: null,  // Date object
+    selectionEnd: null,    // Date object
+    downloadingCam: null,  // camera name currently downloading, or null
 
     get currentTimeDisplay() {
       if (!this.wallTime) return '--:--:--';
@@ -876,6 +976,7 @@ function nvr() {
 
     async changeDate(newDate) {
       this.pause();
+      this.clearSelection();
       this.selectedDate = newDate;
       this.wallTime = new Date(newDate + 'T12:00:00');
       await this.fetchAllSegments();
@@ -1332,6 +1433,34 @@ function nvr() {
     _fsScrubbing: false,
     _fsScrubEl: null,
 
+    _fsTimeFromEvent(e) {
+      if (!this._fsScrubEl) return null;
+      const rect = this._fsScrubEl.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      const seconds = pct * SECONDS_PER_DAY;
+      return new Date(this._startOfDay().getTime() + seconds * 1000);
+    },
+
+    startFsScrubOrSelect(e) {
+      this._fsScrubEl = e.currentTarget;
+      const point = e.touches ? e.touches[0] : e;
+      if (e.shiftKey) {
+        const clickedTime = this._fsTimeFromEvent(point);
+        if (!clickedTime) return;
+        if (this.wallTime < clickedTime) {
+          this.selectionStart = new Date(this.wallTime);
+          this.selectionEnd = clickedTime;
+        } else {
+          this.selectionStart = clickedTime;
+          this.selectionEnd = new Date(this.wallTime);
+        }
+        return;
+      }
+      this.clearSelection();
+      this.startFsScrub(e);
+    },
+
     startFsScrub(e) {
       this._fsScrubbing = true;
       this._fsScrubEl = e.currentTarget;
@@ -1361,6 +1490,96 @@ function nvr() {
       this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
       this._clampWallTime();
       this.loadSegmentsForAll();
+    },
+
+    // -- Range selection --
+
+    _timeFromOverlayEvent(e) {
+      const overlay = this.$refs.timelineBody?.querySelector('.timeline-click-overlay');
+      if (!overlay) return null;
+      const rect = overlay.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      const seconds = pct * SECONDS_PER_DAY;
+      return new Date(this._startOfDay().getTime() + seconds * 1000);
+    },
+
+    startScrubOrSelect(e) {
+      const point = e.touches ? e.touches[0] : e;
+      if (e.shiftKey) {
+        const clickedTime = this._timeFromOverlayEvent(point);
+        if (!clickedTime) return;
+        // Set range from current wallTime to shift-clicked point
+        if (this.wallTime < clickedTime) {
+          this.selectionStart = new Date(this.wallTime);
+          this.selectionEnd = clickedTime;
+        } else {
+          this.selectionStart = clickedTime;
+          this.selectionEnd = new Date(this.wallTime);
+        }
+        return;
+      }
+      // Normal click: clear selection and scrub
+      this.clearSelection();
+      this.startScrub(e);
+    },
+
+    clearSelection() {
+      this.selectionStart = null;
+      this.selectionEnd = null;
+    },
+
+    selectionStyle() {
+      if (!this.selectionStart || !this.selectionEnd) return 'display:none';
+      const sod = this._startOfDay();
+      const startPct = (this.selectionStart - sod) / 1000 / SECONDS_PER_DAY * 100;
+      const endPct = (this.selectionEnd - sod) / 1000 / SECONDS_PER_DAY * 100;
+      const left = Math.max(0, Math.min(100, startPct));
+      const right = Math.max(0, Math.min(100, endPct));
+      return `left:${left}%;width:${right - left}%`;
+    },
+
+    selectionRangeDisplay() {
+      if (!this.selectionStart || !this.selectionEnd) return '';
+      const fmt = d => [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map(n => String(n).padStart(2, '0')).join(':');
+      return fmt(this.selectionStart) + ' \u2013 ' + fmt(this.selectionEnd);
+    },
+
+    rangeDownloadUrl(camName) {
+      if (!this.selectionStart || !this.selectionEnd) return '#';
+      const s = this.selectionStart.toISOString();
+      const e = this.selectionEnd.toISOString();
+      return `/api/cameras/${encodeURIComponent(camName)}/download?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`;
+    },
+
+    async downloadRange(camName) {
+      const url = this.rangeDownloadUrl(camName);
+      if (url === '#') return;
+      this.downloadingCam = camName;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          const detail = await res.text();
+          alert('Download failed: ' + detail);
+          return;
+        }
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        // Extract filename from Content-Disposition or build one
+        const cd = res.headers.get('Content-Disposition');
+        const match = cd && cd.match(/filename="(.+)"/);
+        a.download = match ? match[1] : `${camName}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        alert('Download failed: ' + e.message);
+      } finally {
+        this.downloadingCam = null;
+      }
     },
   };
 }
