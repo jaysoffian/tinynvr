@@ -678,7 +678,7 @@ function nvr() {
     playbackSpeed: 1,
     fullscreenIdx: null,
     scrubbing: false,
-    _manualSeek: false,
+    _seekTarget: null,
     animFrameId: null,
     weekOffset: 0,
     weekDays: [],
@@ -933,12 +933,7 @@ function nvr() {
         }
       };
 
-      // Use loadedmetadata if we need it, but also handle if already loaded
-      if (video.readyState >= 1) {
-        onReady();
-      } else {
-        video.addEventListener('loadedmetadata', onReady, { once: true });
-      }
+      video.addEventListener('loadedmetadata', onReady, { once: true });
 
       // Handle segment end: load next
       video.onended = () => this._onSegmentEnd(idx);
@@ -952,25 +947,26 @@ function nvr() {
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
-        // Clear manual seek flag once this seek lands (primary video only)
-        if (this._manualSeek && video.id === 'video-0') {
-          video.addEventListener('seeked', () => { this._manualSeek = false; }, { once: true });
-        }
-      } else if (this._manualSeek && video.id === 'video-0') {
-        // Already close enough, no seek needed
-        this._manualSeek = false;
       }
     },
 
     onPrimaryTimeUpdate(event) {
-      if (!this.playing || this.scrubbing || this._manualSeek) return;
+      if (!this.playing || this.scrubbing) return;
       const video = event.target;
-      if (video.seeking) return;
+      if (video.seeking || video.readyState < 2) return;
       const state = this.camStates[0];
       if (!state || !state.currentSegment) return;
 
       const segStart = this._parseStart(state.currentSegment).getTime();
-      this.wallTime = new Date(segStart + video.currentTime * 1000);
+      const computed = segStart + video.currentTime * 1000;
+
+      // After a manual seek, wait until the video has converged to the target
+      if (this._seekTarget) {
+        if (Math.abs(computed - this._seekTarget) > 500) return;
+        this._seekTarget = null;
+      }
+
+      this.wallTime = new Date(computed);
 
       // Sync non-primary cameras
       for (let i = 1; i < this.cameras.length; i++) {
@@ -1119,8 +1115,8 @@ function nvr() {
     },
 
     _seekByKey(ms) {
-      this._manualSeek = true;
       this.wallTime = new Date(this.wallTime.getTime() + ms);
+      this._seekTarget = this.wallTime.getTime();
       this.loadSegmentsForAll();
     },
 
