@@ -679,6 +679,8 @@ function nvr() {
     fullscreenIdx: null,
     scrubbing: false,
     animFrameId: null,
+    _seekGen: 0,
+    _settledGen: 0,
     weekOffset: 0,
     weekDays: [],
     earliestDate: null,
@@ -953,6 +955,13 @@ function nvr() {
       if (!this.playing || this.scrubbing) return;
       const video = event.target;
       if (video.seeking || video.readyState < 2) return;
+
+      // After a seek, skip the first post-seek timeupdate (stale data)
+      if (this._settledGen !== this._seekGen) {
+        this._settledGen = this._seekGen;
+        return;
+      }
+
       const state = this.camStates[0];
       if (!state || !state.currentSegment) return;
 
@@ -1106,22 +1115,9 @@ function nvr() {
     },
 
     _seekByKey(ms) {
-      // Pause videos to prevent stale timeupdate events during seek
-      const paused = [];
-      this.cameras.forEach((_, idx) => {
-        const v = this.getVideo(idx);
-        if (v && !v.paused) { v.pause(); paused.push(v); }
-      });
-
+      this._seekGen++;
       this.wallTime = new Date(this.wallTime.getTime() + ms);
       this.loadSegmentsForAll();
-
-      // Resume after seeks settle
-      if (paused.length > 0 && this.playing) {
-        setTimeout(() => {
-          paused.forEach(v => { v.playbackRate = this.playbackSpeed; v.play().catch(() => {}); });
-        }, 50);
-      }
     },
 
     // -- Timeline --
@@ -1150,6 +1146,7 @@ function nvr() {
 
     endScrub() {
       if (!this.scrubbing) return;
+      this._seekGen++;
       this.scrubbing = false;
       this.loadSegmentsForAll();
     },
@@ -1184,6 +1181,7 @@ function nvr() {
 
     endFsScrub() {
       if (!this._fsScrubbing) return;
+      this._seekGen++;
       this._fsScrubbing = false;
       this._fsScrubEl = null;
       this.loadSegmentsForAll();
