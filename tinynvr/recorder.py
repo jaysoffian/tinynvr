@@ -63,6 +63,8 @@ class CameraRecorder:
             self.camera.url,
             "-c",
             "copy",
+            "-metadata",
+            f"title={self.name}",
             "-f",
             "segment",
             "-reset_timestamps",
