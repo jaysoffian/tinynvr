@@ -9,9 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
-    """Delete .mp4 files older than retention_days based on filename timestamp.
+    """Delete .mkv files older than retention_days based on filename timestamp.
 
-    Filenames are like 2026-04-08_02-52-34.mp4 (flat, no date subdirectories).
+    Filenames are like 2026-04-08_02-52-34.mkv (flat, no date subdirectories).
     Returns the number of files deleted.
     """
     root = Path(storage_path)
@@ -25,9 +25,9 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
         if not camera_dir.is_dir():
             continue
         for segment in camera_dir.iterdir():
-            if segment.suffix != ".mp4" or not segment.is_file():
+            if segment.suffix != ".mkv" or not segment.is_file():
                 continue
-            # Parse date from filename: 2026-04-08_02-52-34.mp4
+            # Parse date from filename: 2026-04-08_02-52-34.mkv
             try:
                 file_date = date.fromisoformat(segment.stem[:10])
             except ValueError:

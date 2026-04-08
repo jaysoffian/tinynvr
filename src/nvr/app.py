@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse
+from starlette.responses import Response
 
 from nvr.config import (
     Config,
@@ -117,10 +117,7 @@ async def disable_camera(name: str, request: Request) -> dict:
 
 @app.get("/api/cameras/{name}/segments")
 async def list_segments(name: str, date_str: str, request: Request) -> list[dict]:
-    """List segments for a camera on a given UTC date (date_str=YYYY-MM-DD).
-
-    Filenames are flat: 2026-04-08_02-52-34.mp4
-    """
+    """List segments for a camera on a given UTC date (date_str=YYYY-MM-DD)."""
     config: Config = request.app.state.config
     if name not in config.cameras:
         raise HTTPException(status_code=404, detail=f"Camera '{name}' not found")
@@ -142,7 +139,7 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
     for segment_path in sorted(camera_dir.iterdir()):
         if not segment_path.name.startswith(prefix):
             continue
-        if segment_path.suffix != ".mp4" or not segment_path.is_file():
+        if segment_path.suffix != ".mkv" or not segment_path.is_file():
             continue
         # Parse start_time from filename: 2026-04-08_02-52-34.mp4
         try:
@@ -170,8 +167,8 @@ async def serve_segment(
     camera_name: str,
     filename: str,
     request: Request,
-) -> FileResponse:
-    """Serve a video segment file with Range header support."""
+) -> Response:
+    """Serve a segment by remuxing MKV to fMP4 for browser playback."""
     config: Config = request.app.state.config
     storage = Path(config.storage.path).resolve()
     file_path = (storage / camera_name / filename).resolve()
@@ -179,10 +176,38 @@ async def serve_segment(
     if not file_path.is_relative_to(storage) or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Segment not found")
 
-    return FileResponse(
-        path=file_path,
+    # Remux MKV → fMP4: video copy, audio transcode to AAC (for pcm_mulaw etc.)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(file_path),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        error = stderr.decode(errors="replace").strip()
+        logger.warning("Remux failed for %s: %s", file_path, error)
+        raise HTTPException(status_code=500, detail="Failed to remux segment")
+
+    mp4_name = filename.replace(".mkv", ".mp4")
+    return Response(
+        content=stdout,
         media_type="video/mp4",
-        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{mp4_name}"'},
     )
 
 

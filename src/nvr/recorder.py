@@ -45,12 +45,12 @@ class CameraRecorder:
         return Path(self.storage.path) / self.name
 
     def _build_ffmpeg_args(self) -> list[str]:
-        output_pattern = str(self.output_dir / "%Y-%m-%d_%H-%M-%S.mp4")
+        output_pattern = str(self.output_dir / "%Y-%m-%d_%H-%M-%S.mkv")
         return [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "warning",
             "-rtsp_transport",
             "tcp",
             "-use_wallclock_as_timestamps",
@@ -59,10 +59,8 @@ class CameraRecorder:
             "10000000",
             "-i",
             self.camera.url,
-            "-c:v",
+            "-c",
             "copy",
-            "-c:a",
-            "aac",
             "-f",
             "segment",
             "-reset_timestamps",
@@ -70,13 +68,11 @@ class CameraRecorder:
             "-segment_time",
             str(self.storage.segment_minutes * 60),
             "-segment_format",
-            "mp4",
+            "matroska",
             "-segment_atclocktime",
             "1",
             "-strftime",
             "1",
-            "-movflags",
-            "+frag_keyframe+empty_moov",
             output_pattern,
         ]
 
