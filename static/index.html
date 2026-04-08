@@ -711,7 +711,7 @@ html, body {
                     <polyline points="7 10 12 15 17 10"/>
                     <line x1="12" y1="15" x2="12" y2="3"/>
                   </svg>
-                  <span x-show="downloadingCam === cam.name" style="font-size:11px;">...</span>
+                  <span x-show="downloadingCam === cam.name" style="font-size:11px;" x-text="downloadPercent != null ? downloadPercent + '%' : '...'"></span>
                 </button>
                 <a class="fs-download" x-show="!selectionStart && camStates[idx]?.currentSegment"
                    :href="downloadUrl(idx)" download @click.stop title="Download segment">
@@ -822,7 +822,7 @@ html, body {
           <polyline points="7 10 12 15 17 10"/>
           <line x1="12" y1="15" x2="12" y2="3"/>
         </svg>
-        <span x-text="downloadingCam === cam.name ? 'Preparing...' : cam.name"></span>
+        <span x-text="downloadingCam === cam.name ? (downloadPercent != null ? downloadPercent + '%' : 'Preparing...') : cam.name"></span>
       </button>
     </template>
     <button class="sel-clear" @click="clearSelection()" title="Clear selection">&times;</button>
@@ -853,7 +853,8 @@ function nvr() {
     canGoBack: true,
     selectionStart: null,  // Date object
     selectionEnd: null,    // Date object
-    downloadingCam: null,  // camera name currently downloading, or null
+    downloadingCam: null,   // camera name currently downloading, or null
+    downloadPercent: null,  // 0-100 or null
 
     get currentTimeDisplay() {
       if (!this.wallTime) return '--:--:--';
@@ -1553,10 +1554,31 @@ function nvr() {
       return `/api/cameras/${encodeURIComponent(camName)}/download?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`;
     },
 
+    _estimateDownloadSize(camName) {
+      const segs = this.segments[camName] || [];
+      if (!this.selectionStart || !this.selectionEnd || !segs.length) return 0;
+      const selStart = this.selectionStart.getTime();
+      const selEnd = this.selectionEnd.getTime();
+      let total = 0;
+      for (const seg of segs) {
+        const segStart = new Date(seg.start_time).getTime();
+        const dur = (seg.duration_sec || this._segmentDurationMs / 1000) * 1000;
+        const segEnd = segStart + dur;
+        if (segEnd <= selStart || segStart >= selEnd) continue;
+        // Pro-rate partial overlap
+        const overlapStart = Math.max(segStart, selStart);
+        const overlapEnd = Math.min(segEnd, selEnd);
+        const fraction = (overlapEnd - overlapStart) / dur;
+        total += (seg.size_bytes || 0) * fraction;
+      }
+      return total;
+    },
+
     async downloadRange(camName) {
       const url = this.rangeDownloadUrl(camName);
       if (url === '#') return;
       this.downloadingCam = camName;
+      this.downloadPercent = 0;
       try {
         const res = await fetch(url);
         if (!res.ok) {
@@ -1564,10 +1586,25 @@ function nvr() {
           alert('Download failed: ' + detail);
           return;
         }
-        const blob = await res.blob();
+
+        const estimatedSize = this._estimateDownloadSize(camName);
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (estimatedSize > 0) {
+            this.downloadPercent = Math.min(99, Math.round(received / estimatedSize * 100));
+          }
+        }
+        this.downloadPercent = 100;
+
+        const blob = new Blob(chunks, { type: 'video/mp4' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        // Extract filename from Content-Disposition or build one
         const cd = res.headers.get('Content-Disposition');
         const match = cd && cd.match(/filename="(.+)"/);
         a.download = match ? match[1] : `${camName}.mp4`;
@@ -1579,6 +1616,7 @@ function nvr() {
         alert('Download failed: ' + e.message);
       } finally {
         this.downloadingCam = null;
+        this.downloadPercent = null;
       }
     },
   };
