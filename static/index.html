@@ -746,7 +746,11 @@ function nvr() {
           fetch('/api/config'),
         ]);
         const range = await rangeRes.json();
-        this.earliestDate = range.earliest;
+        if (range.earliest) {
+          // Convert UTC timestamp to local date string for date picker
+          const d = new Date(range.earliest);
+          this.earliestDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        }
         const config = await configRes.json();
         if (config.storage?.segment_minutes) {
           this._segmentDurationMs = config.storage.segment_minutes * 60 * 1000;
@@ -847,6 +851,26 @@ function nvr() {
 
     _parseStart(seg) {
       return new Date(seg.start_time);
+    },
+
+    _latestEnd() {
+      // Find the latest segment end across all cameras
+      let latest = 0;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        if (segs.length > 0) {
+          const end = this._segEnd(segs, segs.length - 1);
+          if (end > latest) latest = end;
+        }
+      }
+      return latest;
+    },
+
+    _clampWallTime() {
+      const latest = this._latestEnd();
+      if (latest && this.wallTime.getTime() > latest) {
+        this.wallTime = new Date(latest);
+      }
     },
 
     _segEnd(segs, i) {
@@ -1046,9 +1070,16 @@ function nvr() {
             // Video not usable — free-run the clock
             this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
           }
+
+          // Stop at end of recordings
+          const latest = this._latestEnd();
+          if (latest && this.wallTime.getTime() >= latest) {
+            this.wallTime = new Date(latest);
+            this.pause();
+            this._clockId = null;
+            return;
+          }
         }
-        // During settling: wallTime stays at the value set by the seek.
-        // During scrubbing: wallTime is driven by the scrub handler.
 
         // Sync all cameras: check segment boundaries, load new segments
         for (let i = 0; i < this.cameras.length; i++) {
@@ -1127,6 +1158,7 @@ function nvr() {
 
     _seekByKey(ms) {
       this.wallTime = new Date(this.wallTime.getTime() + ms);
+      this._clampWallTime();
       this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
@@ -1171,6 +1203,7 @@ function nvr() {
       const pct = x / rect.width;
       const seconds = pct * SECONDS_PER_DAY;
       this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
+      this._clampWallTime();
       this.loadSegmentsForAll();
     },
 
@@ -1207,6 +1240,7 @@ function nvr() {
       const pct = x / rect.width;
       const seconds = pct * SECONDS_PER_DAY;
       this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
+      this._clampWallTime();
       this.loadSegmentsForAll();
     },
   };

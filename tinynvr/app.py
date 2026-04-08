@@ -78,23 +78,28 @@ async def get_config(request: Request) -> dict:
 
 @app.get("/api/recordings/range")
 async def recordings_range(request: Request) -> dict:
-    """Return the earliest recording date across all cameras."""
+    """Return the earliest recording timestamp across all cameras."""
     config: Config = request.app.state.config
     storage = Path(config.storage.path)
     if not storage.is_dir():
         return {"earliest": None}
 
-    earliest: str | None = None
+    earliest: datetime | None = None
     for camera_dir in storage.iterdir():
         if not camera_dir.is_dir():
             continue
         for segment in camera_dir.iterdir():
             if segment.suffix != ".mkv" or not segment.is_file():
                 continue
-            date_part = segment.stem[:10]
-            if earliest is None or date_part < earliest:
-                earliest = date_part
-    return {"earliest": earliest}
+            try:
+                ts = datetime.strptime(segment.stem, "%Y-%m-%d_%H-%M-%S").replace(
+                    tzinfo=UTC
+                )
+            except ValueError:
+                continue
+            if earliest is None or ts < earliest:
+                earliest = ts
+    return {"earliest": earliest.isoformat() if earliest else None}
 
 
 @app.get("/api/cameras")
