@@ -16,8 +16,8 @@ A lightweight, self-hosted NVR that records RTSP camera streams and provides a w
 ## Quick start
 
 ```bash
-git clone https://github.com/jaysoffian/nvr
-cd nvr
+git clone https://github.com/jaysoffian/tinynvr
+cd tinynvr
 mise install
 cp config.yaml.example config.yaml
 # Edit config.yaml with your RTSP URLs
@@ -51,12 +51,12 @@ POST to `/api/webhook/{camera_name}` to toggle a camera on or off:
 
 ```bash
 # Disable a camera
-curl -X POST http://nvr:8554/api/webhook/living-room \
+curl -X POST http://tinynvr:8554/api/webhook/living-room \
   -H 'Content-Type: application/json' \
   -d '{"enabled": false}'
 
 # Re-enable it
-curl -X POST http://nvr:8554/api/webhook/living-room \
+curl -X POST http://tinynvr:8554/api/webhook/living-room \
   -H 'Content-Type: application/json' \
   -d '{"enabled": true}'
 ```
@@ -64,12 +64,12 @@ curl -X POST http://nvr:8554/api/webhook/living-room \
 ## Docker
 
 ```bash
-docker build -t nvr .
+docker build -t tinynvr .
 docker run -d \
   -p 8554:8554 \
   -v /path/to/recordings:/recordings \
   -v /path/to/config.yaml:/app/config.yaml \
-  nvr
+  tinynvr
 ```
 
 ## Development
