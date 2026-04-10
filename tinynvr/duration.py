@@ -74,7 +74,7 @@ async def _probe_duration(mkv: Path) -> float:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
             "-v",
-            "quiet",
+            "error",
             "-print_format",
             "json",
             "-show_format",
@@ -82,20 +82,28 @@ async def _probe_duration(mkv: Path) -> float:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode != 0:
-            logger.debug("ffprobe failed for %s (rc=%d)", mkv.name, proc.returncode)
+            err = stderr.decode(errors="replace").strip().replace("\n", " | ")
+            size = mkv.stat().st_size if mkv.exists() else -1
+            logger.warning(
+                "ffprobe failed for %s (rc=%d, size=%d): %s",
+                mkv,
+                proc.returncode,
+                size,
+                err or "<no stderr>",
+            )
             return 0.0
         info = json.loads(stdout)
         raw = info.get("format", {}).get("duration")
         if raw is None:
-            logger.debug("ffprobe for %s returned no duration", mkv.name)
+            logger.warning("ffprobe for %s returned no duration", mkv)
             return 0.0
         dur = min(float(raw), _MAX_DURATION)
-        logger.debug("ffprobe %s: %.3fs", mkv.name, dur)
+        logger.debug("ffprobe %s: %.3fs", mkv, dur)
         return dur
     except (ValueError, OSError) as exc:
-        logger.debug("ffprobe errored for %s: %s", mkv.name, exc)
+        logger.warning("ffprobe errored for %s: %s", mkv, exc)
         return 0.0
 
 
