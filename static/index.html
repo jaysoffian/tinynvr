@@ -672,7 +672,7 @@ html, body {
         <div class="no-recording-overlay"
              x-show="!camStates[idx]?.currentSegment"
              x-cloak>
-          <span>No recording</span>
+          <span x-text="loading ? 'Loading\u2026' : 'Offline'"></span>
         </div>
         <!-- Fullscreen overlay with controls + timeline -->
         <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
@@ -769,7 +769,7 @@ html, body {
           <div class="timeline-track">
             <span class="timeline-track-label" x-text="cam.name"></span>
             <div class="timeline-track-bar">
-              <template x-for="seg in (segments[cam.name] || [])" :key="seg.filename">
+              <template x-for="seg in timelineSegments(cam)" :key="seg.filename">
                 <div class="timeline-segment-block"
                      :style="segmentBlockStyle(seg)"></div>
               </template>
@@ -835,6 +835,7 @@ function nvr() {
   const SECONDS_PER_DAY = 86400;
 
   return {
+    loading: true,
     cameras: [],
     segments: {},       // { cameraName: [segment, ...] }
     camStates: {},      // { idx: { currentSegment, nextSegment, loadedSrc } }
@@ -934,6 +935,7 @@ function nvr() {
       await this.fetchCameras();
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       await this.fetchAllSegments();
+      this.loading = false;
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
       this._startSegmentRefresh();
@@ -1386,12 +1388,30 @@ function nvr() {
 
     // -- Timeline --
 
+    timelineSegments(cam) {
+      const segs = this.segments[cam.name] || [];
+      const isRecording = cam.state === 'recording';
+      return segs.filter((seg, i) => {
+        // Keep segments with known duration
+        if (seg.duration_sec != null) return true;
+        // For the last segment of a recording camera, show it (actively recording)
+        return isRecording && i === segs.length - 1;
+      });
+    },
+
     segmentBlockStyle(seg) {
       const start = this._parseStart(seg);
       const sod = this._startOfDay();
       const startSec = (start - sod) / 1000;
       const left = startSec / SECONDS_PER_DAY * 100;
-      const durSec = seg.duration_sec || this._segmentDurationMs / 1000;
+      let durSec;
+      if (seg.duration_sec != null) {
+        durSec = seg.duration_sec;
+      } else {
+        // Active recording: extend to now, capped at segment duration
+        const elapsed = (Date.now() - start.getTime()) / 1000;
+        durSec = Math.min(elapsed, this._segmentDurationMs / 1000);
+      }
       const width = durSec / SECONDS_PER_DAY * 100;
       return `left:${left}%;width:${width}%`;
     },
