@@ -68,8 +68,8 @@ def read_indexes(camera_dir: Path, date_strs: list[str]) -> dict[str, float]:
     return merged
 
 
-async def _probe_duration(mkv: Path) -> float:
-    """Probe a single file with ffprobe. Returns 0.0 on failure."""
+async def _probe_duration(mkv: Path) -> float | None:
+    """Probe a single file with ffprobe. Returns ``None`` on failure."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
@@ -80,31 +80,31 @@ async def _probe_duration(mkv: Path) -> float:
             "-show_format",
             str(mkv),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip().replace("\n", " | ")
-            size = mkv.stat().st_size if mkv.exists() else -1
-            logger.warning(
-                "ffprobe failed for %s (rc=%d, size=%d): %s",
-                mkv,
-                proc.returncode,
-                size,
-                err or "<no stderr>",
-            )
-            return 0.0
+            return None
         info = json.loads(stdout)
         raw = info.get("format", {}).get("duration")
         if raw is None:
-            logger.warning("ffprobe for %s returned no duration", mkv)
-            return 0.0
+            return None
         dur = min(float(raw), _MAX_DURATION)
         logger.debug("ffprobe %s: %.3fs", mkv, dur)
         return dur
     except (ValueError, OSError) as exc:
         logger.warning("ffprobe errored for %s: %s", mkv, exc)
-        return 0.0
+        return None
+
+
+def _unlink_unplayable(mkv: Path) -> None:
+    """Remove a segment that ffprobe could not read."""
+    try:
+        mkv.unlink()
+    except OSError as exc:
+        logger.warning("Failed to delete unplayable %s: %s", mkv, exc)
+        return
+    logger.info("Deleted unplayable segment %s", mkv)
 
 
 def _append_entry(camera_dir: Path, filename: str, duration: float) -> None:
@@ -119,12 +119,16 @@ def _append_entry(camera_dir: Path, filename: str, duration: float) -> None:
 async def append_duration(camera_dir: Path, mkv: Path) -> float | None:
     """Probe one completed segment and append its duration to the daily index.
 
-    Returns the probed duration in seconds, or ``None`` if the filename
-    isn't a valid segment name.
+    Unplayable segments are deleted and not indexed.  Returns the probed
+    duration in seconds, or ``None`` if the segment was unplayable or
+    the filename isn't a valid segment name.
     """
     if _date_from_mkv(mkv) is None:
         return None
     dur = await _probe_duration(mkv)
+    if dur is None:
+        _unlink_unplayable(mkv)
+        return None
     _append_entry(camera_dir, mkv.name, dur)
     return dur
 
@@ -153,11 +157,12 @@ async def validate_indexes(camera_dir: Path) -> None:
 
     sem = asyncio.Semaphore(8)
 
-    async def _probe(p: Path) -> tuple[str, float]:
+    async def _probe(p: Path) -> tuple[Path, float | None]:
         async with sem:
-            return p.name, await _probe_duration(p)
+            return p, await _probe_duration(p)
 
     total = 0
+    deleted = 0
     for date_str, mkvs in sorted(by_date.items()):
         known = read_index(camera_dir, date_str)
         to_probe = [m for m in mkvs if m.name not in known]
@@ -171,10 +176,16 @@ async def validate_indexes(camera_dir: Path) -> None:
         )
         results = await asyncio.gather(*(_probe(p) for p in to_probe))
         with index_path(camera_dir, date_str).open("a") as f:
-            for name, dur in results:
-                f.write(f"{name}: {round(dur, 3)}\n")
+            for mkv, dur in results:
+                if dur is None:
+                    _unlink_unplayable(mkv)
+                    deleted += 1
+                    continue
+                f.write(f"{mkv.name}: {round(dur, 3)}\n")
                 f.flush()
-        total += len(results)
+                total += 1
 
     if total:
         logger.info("Indexed %d backlog segment(s) for %s", total, camera_dir.name)
+    if deleted:
+        logger.info("Deleted %d unplayable segment(s) for %s", deleted, camera_dir.name)

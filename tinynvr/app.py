@@ -243,7 +243,7 @@ async def serve_segment(
         "mp4",
         "pipe:1",
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
 
     # Race ffmpeg against client disconnect so we kill the process
@@ -265,12 +265,13 @@ async def serve_segment(
     if comm_task not in done:
         return Response(status_code=499)
 
-    stdout, stderr = comm_task.result()
+    stdout, _ = comm_task.result()
 
     if proc.returncode != 0:
-        error = stderr.decode(errors="replace").strip()
-        logger.warning("Remux failed for %s: %s", file_path, error)
-        raise HTTPException(status_code=500, detail="Failed to remux segment")
+        logger.warning("Remux failed for %s, deleting", file_path)
+        with contextlib.suppress(OSError):
+            file_path.unlink()
+        raise HTTPException(status_code=404, detail="Segment unplayable")
 
     # Sanitize filename for Content-Disposition header
     safe_name = re.sub(r"[^\w.\-]", "_", filename.replace(".mkv", ".mp4"))
