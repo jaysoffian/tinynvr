@@ -26,6 +26,20 @@ from tinynvr.duration import read_index, read_indexes
 from tinynvr.recorder import RecordingManager
 from tinynvr.retention import retention_loop
 
+
+def _configure_logging() -> None:
+    """Emit DEBUG+ for our own loggers; leave third-party loggers alone."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+    app_logger = logging.getLogger("tinynvr")
+    app_logger.setLevel(logging.DEBUG)
+    app_logger.addHandler(handler)
+    app_logger.propagate = False
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 

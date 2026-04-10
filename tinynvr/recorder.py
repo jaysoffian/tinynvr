@@ -132,9 +132,12 @@ class CameraRecorder:
 
     async def _index_segment(self, mkv: Path) -> None:
         try:
-            await append_duration(self.output_dir, mkv)
+            dur = await append_duration(self.output_dir, mkv)
         except Exception:
             logger.exception("Failed to index segment %s for %s", mkv.name, self.name)
+            return
+        if dur is not None:
+            logger.info("Indexed %s for %s (%.1fs)", mkv.name, self.name, dur)
 
     async def _watcher_loop(self) -> None:
         """Append each finished segment's duration to its daily .idx file.

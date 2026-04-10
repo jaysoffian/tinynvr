@@ -19,7 +19,10 @@ re-read during runtime.
 
 import asyncio
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _MAX_DURATION = 3600.0  # 1 hour sanity cap
 
@@ -81,13 +84,18 @@ async def _probe_duration(mkv: Path) -> float:
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode != 0:
+            logger.debug("ffprobe failed for %s (rc=%d)", mkv.name, proc.returncode)
             return 0.0
         info = json.loads(stdout)
         raw = info.get("format", {}).get("duration")
         if raw is None:
+            logger.debug("ffprobe for %s returned no duration", mkv.name)
             return 0.0
-        return min(float(raw), _MAX_DURATION)
-    except ValueError, OSError:
+        dur = min(float(raw), _MAX_DURATION)
+        logger.debug("ffprobe %s: %.3fs", mkv.name, dur)
+        return dur
+    except (ValueError, OSError) as exc:
+        logger.debug("ffprobe errored for %s: %s", mkv.name, exc)
         return 0.0
 
 
@@ -100,12 +108,17 @@ def _append_entry(camera_dir: Path, filename: str, duration: float) -> None:
         f.write(f"{filename}: {round(duration, 3)}\n")
 
 
-async def append_duration(camera_dir: Path, mkv: Path) -> None:
-    """Probe one completed segment and append its duration to the daily index."""
+async def append_duration(camera_dir: Path, mkv: Path) -> float | None:
+    """Probe one completed segment and append its duration to the daily index.
+
+    Returns the probed duration in seconds, or ``None`` if the filename
+    isn't a valid segment name.
+    """
     if _date_from_mkv(mkv) is None:
-        return
+        return None
     dur = await _probe_duration(mkv)
     _append_entry(camera_dir, mkv.name, dur)
+    return dur
 
 
 async def validate_indexes(camera_dir: Path) -> None:
@@ -136,13 +149,24 @@ async def validate_indexes(camera_dir: Path) -> None:
         async with sem:
             return p.name, await _probe_duration(p)
 
-    for date_str, mkvs in by_date.items():
+    total = 0
+    for date_str, mkvs in sorted(by_date.items()):
         known = read_index(camera_dir, date_str)
         to_probe = [m for m in mkvs if m.name not in known]
         if not to_probe:
             continue
+        logger.info(
+            "Indexing %d segment(s) for %s on %s",
+            len(to_probe),
+            camera_dir.name,
+            date_str,
+        )
         results = await asyncio.gather(*(_probe(p) for p in to_probe))
         with index_path(camera_dir, date_str).open("a") as f:
             for name, dur in results:
                 f.write(f"{name}: {round(dur, 3)}\n")
                 f.flush()
+        total += len(results)
+
+    if total:
+        logger.info("Indexed %d backlog segment(s) for %s", total, camera_dir.name)
