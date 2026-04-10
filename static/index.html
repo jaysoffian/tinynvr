@@ -297,7 +297,6 @@ html, body {
   top: 0;
   height: 100%;
   background: var(--segment-color);
-  border-radius: 1px;
 }
 
 /* Hour labels */
@@ -520,7 +519,6 @@ html, body {
   top: 0;
   height: 100%;
   background: var(--segment-color);
-  border-radius: 2px;
 }
 .fs-timeline-cursor {
   position: absolute;
@@ -670,9 +668,9 @@ html, body {
                playsinline>
         </video>
         <div class="no-recording-overlay"
-             x-show="!camStates[idx]?.currentSegment"
+             x-show="!camStates[idx]?.currentSegment || camStates[idx]?.videoLoading"
              x-cloak>
-          <span x-text="loading ? 'Loading\u2026' : 'Offline'"></span>
+          <span x-text="loading || camStates[idx]?.videoLoading ? 'Loading\u2026' : 'Offline'"></span>
         </div>
         <!-- Fullscreen overlay with controls + timeline -->
         <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
@@ -993,7 +991,7 @@ function nvr() {
         const res = await fetch('/api/cameras');
         this.cameras = await res.json();
         this.cameras.forEach((_, idx) => {
-          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null };
+          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, videoLoading: false };
         });
       } catch (e) {
         console.error('Failed to fetch cameras:', e);
@@ -1138,6 +1136,7 @@ function nvr() {
           state.currentSegment = null;
           state.nextSegment = null;
           state.loadedSrc = null;
+          state.videoLoading = false;
         }
         video.onloadedmetadata = null;
         video.removeAttribute('src');
@@ -1165,6 +1164,7 @@ function nvr() {
         state.currentSegment = seg;
         state.nextSegment = next;
         state.loadedSrc = url;
+        state.videoLoading = true;
       }
 
       video.src = url;
@@ -1173,6 +1173,7 @@ function nvr() {
       // replace the handler instead of accumulating stale listeners
       video.onloadedmetadata = () => {
         video.onloadedmetadata = null;
+        if (state) state.videoLoading = false;
         video.muted = this.unmutedIdx !== idx;
         this._seekVideo(video, seg);
         if (this.playing) {
@@ -1183,6 +1184,7 @@ function nvr() {
 
       video.onerror = () => {
         video.onerror = null;
+        if (state) state.videoLoading = false;
         // Segment failed to load (corrupt file, 500, etc.) — skip it
         this._onSegmentEnd(idx);
       };
