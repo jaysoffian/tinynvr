@@ -103,6 +103,12 @@ class CameraRecorder:
             self._monitor_task = None
         await self._kill_process()
         if self._watcher_task:
+            # Give the watcher a tick to pick up the IN_CLOSE_WRITE for
+            # ffmpeg's final segment and dispatch its append task before
+            # we cancel. Any append already in flight is drained by the
+            # watcher's CancelledError handler; anything missed is still
+            # recovered by validate_indexes() on the next start().
+            await asyncio.sleep(0.05)
             self._watcher_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._watcher_task
@@ -124,13 +130,24 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
+    async def _index_segment(self, mkv: Path) -> None:
+        try:
+            await append_duration(self.output_dir, mkv)
+        except Exception:
+            logger.exception("Failed to index segment %s for %s", mkv.name, self.name)
+
     async def _watcher_loop(self) -> None:
         """Append each finished segment's duration to its daily .idx file.
 
         Driven by inotify ``IN_CLOSE_WRITE`` events, which fire whenever
         ffmpeg closes a segment file — whether via normal rotation or
         on process exit (clean, SIGTERM, SIGKILL, or crash).
+
+        Each event dispatches a detached append task so the iterator
+        isn't blocked on ffprobe and so :meth:`stop` can drain any
+        in-flight appends before cancelling the watcher.
         """
+        pending: set[asyncio.Task[None]] = set()
         try:
             with Inotify() as inotify:
                 inotify.add_watch(self.output_dir, Mask.CLOSE_WRITE)
@@ -138,17 +155,14 @@ class CameraRecorder:
                     path = event.path
                     if path is None or path.suffix != ".mkv":
                         continue
-                    try:
-                        await append_duration(
-                            self.output_dir, self.output_dir / path.name
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to index segment %s for %s",
-                            path.name,
-                            self.name,
-                        )
+                    task = asyncio.create_task(
+                        self._index_segment(self.output_dir / path.name)
+                    )
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
         except asyncio.CancelledError:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             raise
         except Exception:
             logger.exception("Inotify watcher for %s failed", self.name)

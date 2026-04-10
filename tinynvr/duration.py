@@ -51,7 +51,7 @@ def read_index(camera_dir: Path, date_str: str) -> dict[str, float]:
     p = index_path(camera_dir, date_str)
     try:
         text = p.read_text()
-    except FileNotFoundError, OSError:
+    except OSError:
         return {}
     # Last entry wins on duplicate filenames
     return dict(_parse_line(line) for line in text.splitlines())
@@ -87,7 +87,7 @@ async def _probe_duration(mkv: Path) -> float:
         if raw is None:
             return 0.0
         return min(float(raw), _MAX_DURATION)
-    except TimeoutError, json.JSONDecodeError, ValueError, OSError:
+    except ValueError, OSError:
         return 0.0
 
 
@@ -145,3 +145,4 @@ async def validate_indexes(camera_dir: Path) -> None:
         with index_path(camera_dir, date_str).open("a") as f:
             for name, dur in results:
                 f.write(f"{name}: {round(dur, 3)}\n")
+                f.flush()
