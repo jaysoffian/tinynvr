@@ -980,9 +980,11 @@ function nvr() {
     async changeDate(newDate) {
       this.pause();
       this.clearSelection();
+      this.loading = true;
       this.selectedDate = newDate;
       this.wallTime = new Date(newDate + 'T12:00:00');
       await this.fetchAllSegments();
+      this.loading = false;
       this._pickInitialWallTime();
       this.loadSegmentsForAll();
       this._startSegmentRefresh();
@@ -1194,7 +1196,7 @@ function nvr() {
       if (!video || !seg || !this.wallTime) return;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
-      const dur = isNaN(video.duration) ? (seg.duration_sec || this._segmentDurationMs / 1000) : video.duration;
+      const dur = isNaN(video.duration) ? (seg.duration_sec ?? this._segmentDurationMs / 1000) : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
@@ -1582,7 +1584,7 @@ function nvr() {
       let total = 0;
       for (const seg of segs) {
         const segStart = new Date(seg.start_time).getTime();
-        const dur = (seg.duration_sec || this._segmentDurationMs / 1000) * 1000;
+        const dur = (seg.duration_sec ?? this._segmentDurationMs / 1000) * 1000;
         const segEnd = segStart + dur;
         if (segEnd <= selStart || segStart >= selEnd) continue;
         // Pro-rate partial overlap
