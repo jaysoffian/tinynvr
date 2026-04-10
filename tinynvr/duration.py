@@ -1,50 +1,72 @@
-"""Sidecar .json files for segment metadata caching.
+"""Per-camera daily index files for segment durations.
 
-Each .mkv segment gets a .json JSON sidecar containing at minimum its
-duration.  Written by the recorder when a segment completes, and
-backfilled by the server on first access for any missing ones.
+Each camera directory contains one ``{YYYY-MM-DD}.idx`` per UTC day — a
+simple append-only text file with one entry per line::
+
+    2026-04-10_12-00-00.mkv: 600.0
+    2026-04-10_12-10-00.mkv: 0
+
+Failed probes are recorded as ``0`` so corrupt/incomplete segments
+aren't re-probed.  When a filename appears more than once (recovery
+case), the last entry wins.
+
+The recorder runs :func:`validate_indexes` once at startup to catch
+segments left behind by a prior run, then relies on an inotify
+``IN_CLOSE_WRITE`` watch to call :func:`append_duration` each time
+ffmpeg closes a completed segment.  The ``.idx`` files are never
+re-read during runtime.
 """
 
 import asyncio
 import json
-import logging
 from pathlib import Path
-from typing import Any
-
-logger = logging.getLogger(__name__)
 
 _MAX_DURATION = 3600.0  # 1 hour sanity cap
 
 
-def sidecar_path(mkv: Path) -> Path:
-    """Return the .json sidecar path for an MKV file."""
-    return mkv.with_suffix(".json")
+def index_path(camera_dir: Path, date_str: str) -> Path:
+    """Return the daily index file path for a given UTC date."""
+    return camera_dir / f"{date_str}.idx"
 
 
-def read_sidecar(mkv: Path) -> dict[str, Any] | None:
-    """Read sidecar metadata, or None if missing/invalid."""
-    p = sidecar_path(mkv)
-    if not p.exists():
+def _date_from_mkv(mkv: Path) -> str | None:
+    """Extract YYYY-MM-DD from a segment filename."""
+    stem = mkv.stem  # expects "YYYY-MM-DD_HH-MM-SS"
+    if len(stem) < 10 or stem[4] != "-" or stem[7] != "-":
         return None
+    return stem[:10]
+
+
+def _parse_line(line: str) -> tuple[str, float]:
+    """Parse one ``FILENAME: duration`` line."""
+    name, _, val = line.partition(":")
+    return name.strip(), float(val)
+
+
+def read_index(camera_dir: Path, date_str: str) -> dict[str, float]:
+    """Return ``{filename: duration_sec}`` from a daily index, or ``{}``.
+
+    Last entry wins on duplicate filenames.
+    """
+    p = index_path(camera_dir, date_str)
     try:
-        return json.loads(p.read_text())
-    except json.JSONDecodeError, OSError:
-        return None
+        text = p.read_text()
+    except FileNotFoundError, OSError:
+        return {}
+    # Last entry wins on duplicate filenames
+    return dict(_parse_line(line) for line in text.splitlines())
 
 
-def read_duration(mkv: Path) -> float | None:
-    """Read cached duration from sidecar, or None if missing."""
-    nfo = read_sidecar(mkv)
-    if nfo is None:
-        return None
-    dur = nfo.get("duration_sec")
-    if dur is None:
-        return None
-    return min(float(dur), _MAX_DURATION)
+def read_indexes(camera_dir: Path, date_strs: list[str]) -> dict[str, float]:
+    """Read multiple daily indexes and merge into one dict."""
+    merged: dict[str, float] = {}
+    for date_str in date_strs:
+        merged.update(read_index(camera_dir, date_str))
+    return merged
 
 
-async def probe_and_write(mkv: Path) -> float | None:
-    """Probe duration with ffprobe and write .json sidecar. Returns seconds."""
+async def _probe_duration(mkv: Path) -> float:
+    """Probe a single file with ffprobe. Returns 0.0 on failure."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe",
@@ -59,45 +81,67 @@ async def probe_and_write(mkv: Path) -> float | None:
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         if proc.returncode != 0:
-            return None
+            return 0.0
         info = json.loads(stdout)
         raw = info.get("format", {}).get("duration")
         if raw is None:
-            return None
-        dur = min(float(raw), _MAX_DURATION)
-        nfo = {"duration_sec": round(dur, 3)}
-        sidecar_path(mkv).write_text(json.dumps(nfo) + "\n")
-        return dur
+            return 0.0
+        return min(float(raw), _MAX_DURATION)
     except TimeoutError, json.JSONDecodeError, ValueError, OSError:
-        return None
+        return 0.0
 
 
-async def ensure_durations(paths: list[Path]) -> dict[str, float]:
-    """Return {filename: duration_sec} for all paths, probing any missing.
+def _append_entry(camera_dir: Path, filename: str, duration: float) -> None:
+    """Append a single ``FILENAME: duration`` line to the matching daily index."""
+    date_str = _date_from_mkv(Path(filename))
+    if date_str is None:
+        return
+    with index_path(camera_dir, date_str).open("a") as f:
+        f.write(f"{filename}: {round(duration, 3)}\n")
 
-    Reads from .json sidecars where available, probes with ffprobe otherwise.
-    Probes run concurrently with a concurrency limit.
+
+async def append_duration(camera_dir: Path, mkv: Path) -> None:
+    """Probe one completed segment and append its duration to the daily index."""
+    if _date_from_mkv(mkv) is None:
+        return
+    dur = await _probe_duration(mkv)
+    _append_entry(camera_dir, mkv.name, dur)
+
+
+async def validate_indexes(camera_dir: Path) -> None:
+    """Probe any segments missing from the daily index and append them.
+
+    One-shot sweep intended to run at recorder start, before ffmpeg is
+    launched, to catch segments left behind by a prior run (e.g. after
+    a crash where the inotify event was lost).
     """
-    results: dict[str, float] = {}
-    to_probe: list[Path] = []
+    if not camera_dir.is_dir():
+        return
 
-    for p in paths:
-        dur = read_duration(p)
-        if dur is not None:
-            results[p.name] = dur
-        else:
-            to_probe.append(p)
+    by_date: dict[str, list[Path]] = {}
+    for mkv in camera_dir.glob("*.mkv"):
+        if not mkv.is_file():
+            continue
+        date_str = _date_from_mkv(mkv)
+        if date_str is None:
+            continue
+        by_date.setdefault(date_str, []).append(mkv)
 
-    if not to_probe:
-        return results
+    if not by_date:
+        return
 
     sem = asyncio.Semaphore(8)
 
-    async def _probe(p: Path) -> None:
+    async def _probe(p: Path) -> tuple[str, float]:
         async with sem:
-            dur = await probe_and_write(p)
-            if dur is not None:
-                results[p.name] = dur
+            return p.name, await _probe_duration(p)
 
-    await asyncio.gather(*(_probe(p) for p in to_probe))
-    return results
+    for date_str, mkvs in by_date.items():
+        known = read_index(camera_dir, date_str)
+        to_probe = [m for m in mkvs if m.name not in known]
+        if not to_probe:
+            continue
+        results = await asyncio.gather(*(_probe(p) for p in to_probe))
+        with index_path(camera_dir, date_str).open("a") as f:
+            for name, dur in results:
+                f.write(f"{name}: {round(dur, 3)}\n")

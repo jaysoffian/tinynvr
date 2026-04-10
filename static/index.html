@@ -1055,13 +1055,13 @@ function nvr() {
 
     _latestEnd() {
       // Find the latest playable segment end across all cameras.
-      // Segments without duration_sec are still being recorded and can't
-      // be played, so skip them.
+      // Segments without a positive duration are either still being recorded
+      // or failed to probe — skip them.
       let latest = 0;
       for (const cam of this.cameras) {
         const segs = this.segments[cam.name] || [];
         for (let i = segs.length - 1; i >= 0; i--) {
-          if (segs[i].duration_sec != null) {
+          if (segs[i].duration_sec > 0) {
             const end = this._segEnd(segs, i);
             if (end > latest) latest = end;
             break;
@@ -1080,7 +1080,7 @@ function nvr() {
 
     _segEnd(segs, i) {
       const start = this._parseStart(segs[i]).getTime();
-      if (segs[i].duration_sec != null) {
+      if (segs[i].duration_sec > 0) {
         return start + segs[i].duration_sec * 1000;
       }
       return start + this._segmentDurationMs;
@@ -1196,7 +1196,7 @@ function nvr() {
       if (!video || !seg || !this.wallTime) return;
       const segStart = this._parseStart(seg).getTime();
       const offset = (this.wallTime.getTime() - segStart) / 1000;
-      const dur = isNaN(video.duration) ? (seg.duration_sec ?? this._segmentDurationMs / 1000) : video.duration;
+      const dur = isNaN(video.duration) ? (seg.duration_sec || this._segmentDurationMs / 1000) : video.duration;
       const target = Math.max(0, Math.min(offset, dur));
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
@@ -1394,10 +1394,12 @@ function nvr() {
       const segs = this.segments[cam.name] || [];
       const isRecording = cam.state === 'recording';
       return segs.filter((seg, i) => {
-        // Keep segments with known duration
-        if (seg.duration_sec != null) return true;
-        // For the last segment of a recording camera, show it (actively recording)
-        return isRecording && i === segs.length - 1;
+        // Valid duration: show it
+        if (seg.duration_sec > 0) return true;
+        // 0 = probed and failed; null = not yet probed.
+        // Show the newest not-yet-probed segment if the camera is
+        // actively recording (it's the live segment).
+        return seg.duration_sec == null && isRecording && i === segs.length - 1;
       });
     },
 
@@ -1407,7 +1409,7 @@ function nvr() {
       const startSec = (start - sod) / 1000;
       const left = startSec / SECONDS_PER_DAY * 100;
       let durSec;
-      if (seg.duration_sec != null) {
+      if (seg.duration_sec > 0) {
         durSec = seg.duration_sec;
       } else {
         // Active recording: extend to now, capped at segment duration
@@ -1584,7 +1586,7 @@ function nvr() {
       let total = 0;
       for (const seg of segs) {
         const segStart = new Date(seg.start_time).getTime();
-        const dur = (seg.duration_sec ?? this._segmentDurationMs / 1000) * 1000;
+        const dur = (seg.duration_sec || this._segmentDurationMs / 1000) * 1000;
         const segEnd = segStart + dur;
         if (segEnd <= selStart || segStart >= selEnd) continue;
         // Pro-rate partial overlap

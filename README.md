@@ -10,6 +10,7 @@ A lightweight, self-hosted NVR that records RTSP camera streams and provides a w
 
 ## Requirements
 
+- Linux (uses inotify to index segments as ffmpeg finishes writing them)
 - [mise](https://mise.jdx.dev) (installs uv and prek)
 - ffmpeg
 

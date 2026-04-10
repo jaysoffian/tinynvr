@@ -9,8 +9,10 @@ import time
 from enum import StrEnum
 from pathlib import Path
 
+from asyncinotify import Inotify, Mask
+
 from tinynvr.config import CameraConfig, Config, StorageConfig, save_config
-from tinynvr.duration import ensure_durations
+from tinynvr.duration import append_duration, validate_indexes
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,7 @@ class CameraRecorder:
         self.last_error: str | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._monitor_task: asyncio.Task | None = None
-        self._sidecar_task: asyncio.Task | None = None
+        self._watcher_task: asyncio.Task | None = None
         self._should_run = False
         self._backoff = 1.0
 
@@ -86,23 +88,25 @@ class CameraRecorder:
             return
         self._should_run = True
         self._backoff = 1.0
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        await validate_indexes(self.output_dir)
+        self._watcher_task = asyncio.create_task(self._watcher_loop())
         self._monitor_task = asyncio.create_task(self._monitor())
-        self._sidecar_task = asyncio.create_task(self._sidecar_loop())
 
     async def stop(self) -> None:
         """Stop recording this camera."""
         self._should_run = False
-        if self._sidecar_task:
-            self._sidecar_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._sidecar_task
-            self._sidecar_task = None
         if self._monitor_task:
             self._monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._monitor_task
             self._monitor_task = None
         await self._kill_process()
+        if self._watcher_task:
+            self._watcher_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._watcher_task
+            self._watcher_task = None
         self.state = CameraState.STOPPED
 
     async def _spawn(self) -> None:
@@ -120,26 +124,34 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
-    async def _sidecar_loop(self) -> None:
-        """Periodically write .json sidecars for completed segments."""
-        while True:
-            await asyncio.sleep(60)
-            if not self.output_dir.is_dir():
-                continue
-            mkvs = set()
-            jsons = set()
-            for p in self.output_dir.iterdir():
-                if p.suffix == ".mkv":
-                    mkvs.add(p)
-                elif p.suffix == ".json":
-                    jsons.add(p.with_suffix(".mkv"))
-            missing = sorted(mkvs - jsons, key=lambda p: p.name)
-            # Skip the newest file if we're actively recording —
-            # it's the one ffmpeg is currently writing to.
-            if self.state == CameraState.RECORDING and missing:
-                missing = missing[:-1]
-            if missing:
-                await ensure_durations(missing)
+    async def _watcher_loop(self) -> None:
+        """Append each finished segment's duration to its daily .idx file.
+
+        Driven by inotify ``IN_CLOSE_WRITE`` events, which fire whenever
+        ffmpeg closes a segment file — whether via normal rotation or
+        on process exit (clean, SIGTERM, SIGKILL, or crash).
+        """
+        try:
+            with Inotify() as inotify:
+                inotify.add_watch(self.output_dir, Mask.CLOSE_WRITE)
+                async for event in inotify:
+                    path = event.path
+                    if path is None or path.suffix != ".mkv":
+                        continue
+                    try:
+                        await append_duration(
+                            self.output_dir, self.output_dir / path.name
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to index segment %s for %s",
+                            path.name,
+                            self.name,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Inotify watcher for %s failed", self.name)
 
     async def _kill_process(self) -> None:
         """Send SIGTERM, wait up to 5s, then SIGKILL."""

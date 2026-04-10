@@ -3,6 +3,7 @@ name = "tinynvr"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "asyncinotify>=4.4.2",
     "fastapi",
     "ruamel-yaml>=0.19.1",
     "uvicorn[standard]",

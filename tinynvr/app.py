@@ -8,7 +8,7 @@ import re
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -22,7 +22,7 @@ from tinynvr.config import (
     load_config,
     save_config,
 )
-from tinynvr.duration import ensure_durations
+from tinynvr.duration import read_index, read_indexes
 from tinynvr.recorder import RecordingManager
 from tinynvr.retention import retention_loop
 
@@ -82,28 +82,23 @@ async def get_config(request: Request) -> dict:
 
 @app.get("/api/recordings/range")
 async def recordings_range(request: Request) -> dict:
-    """Return the earliest recording timestamp across all cameras."""
+    """Return the earliest indexed recording date across all cameras."""
     config: Config = request.app.state.config
     storage = Path(config.storage.path)
     if not storage.is_dir():
         return {"earliest": None}
 
-    earliest: datetime | None = None
+    earliest: str | None = None
     for camera_dir in storage.iterdir():
         if not camera_dir.is_dir():
             continue
-        for segment in camera_dir.iterdir():
-            if segment.suffix != ".mkv" or not segment.is_file():
-                continue
-            try:
-                ts = datetime.strptime(segment.stem, "%Y-%m-%d_%H-%M-%S").replace(
-                    tzinfo=UTC
-                )
-            except ValueError:
-                continue
-            if earliest is None or ts < earliest:
-                earliest = ts
-    return {"earliest": earliest.isoformat() if earliest else None}
+        for idx_file in camera_dir.glob("*.idx"):
+            date_str = idx_file.stem
+            if earliest is None or date_str < earliest:
+                earliest = date_str
+    if earliest is None:
+        return {"earliest": None}
+    return {"earliest": f"{earliest}T00:00:00+00:00"}
 
 
 @app.get("/api/cameras")
@@ -163,39 +158,31 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
             detail="Invalid date format, expected YYYY-MM-DD",
         ) from None
 
+    # The recorder owns the daily .idx file and is the sole writer.
+    # Until the recorder has indexed a day, we return nothing for it.
     camera_dir = Path(config.storage.path) / name
-    if not camera_dir.is_dir():
-        return []
-
-    prefix = date_str + "_"
-    paths = []
-    for segment_path in sorted(camera_dir.iterdir()):
-        if not segment_path.name.startswith(prefix):
-            continue
-        if segment_path.suffix != ".mkv" or not segment_path.is_file():
-            continue
-        paths.append(segment_path)
-
-    # Read/backfill sidecar .dur files (probes missing ones in background)
-    durations = await ensure_durations(paths)
+    durations = read_index(camera_dir, date_str)
 
     segments = []
-    for segment_path in paths:
+    for filename, duration_sec in sorted(durations.items()):
         try:
             start_time = (
-                datetime.strptime(segment_path.stem, "%Y-%m-%d_%H-%M-%S")
+                datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S")
                 .replace(tzinfo=UTC)
                 .isoformat()
             )
         except ValueError:
-            start_time = None
-
+            continue
+        try:
+            size_bytes = (camera_dir / filename).stat().st_size
+        except OSError:
+            continue
         segments.append(
             {
-                "filename": segment_path.name,
+                "filename": filename,
                 "start_time": start_time,
-                "size_bytes": segment_path.stat().st_size,
-                "duration_sec": durations.get(segment_path.name),
+                "size_bytes": size_bytes,
+                "duration_sec": duration_sec,
             }
         )
 
@@ -311,35 +298,34 @@ async def download_range(
 
     storage = Path(config.storage.path).resolve()
     camera_dir = storage / name
-    if not camera_dir.is_dir():
-        raise HTTPException(status_code=404, detail="No recordings found")
 
-    # Collect all MKV segments and parse their start times
-    all_segs: list[tuple[datetime, Path]] = []
-    for p in sorted(camera_dir.iterdir()):
-        if p.suffix != ".mkv" or not p.is_file():
-            continue
-        if not p.resolve().is_relative_to(storage):
-            continue
-        try:
-            ts = datetime.strptime(p.stem, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=UTC)
-        except ValueError:
-            continue
-        all_segs.append((ts, p))
+    # Read indexes for the UTC dates spanning the range (plus one day before,
+    # to catch a segment that started late on the prior day).
+    dates: list[str] = []
+    d = (start_dt - timedelta(days=1)).date()
+    end_date = end_dt.date()
+    while d <= end_date:
+        dates.append(d.isoformat())
+        d += timedelta(days=1)
+    durations = read_indexes(camera_dir, dates)
 
-    if not all_segs:
+    if not durations:
         raise HTTPException(status_code=404, detail="No segments found")
-
-    dur_paths = [p for _, p in all_segs]
-    durations = await ensure_durations(dur_paths)
-
-    # Default segment duration from config (fallback)
-    default_dur = config.storage.segment_minutes * 60
 
     # Find segments overlapping [start_dt, end_dt)
     matching: list[tuple[datetime, Path, float]] = []
-    for ts, p in all_segs:
-        dur = durations.get(p.name) or default_dur
+    for filename, dur in sorted(durations.items()):
+        if dur <= 0:
+            continue
+        p = camera_dir / filename
+        if not p.resolve().is_relative_to(storage):
+            continue
+        try:
+            ts = datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S").replace(
+                tzinfo=UTC
+            )
+        except ValueError:
+            continue
         seg_end = ts.timestamp() + dur
         if seg_end <= start_dt.timestamp():
             continue

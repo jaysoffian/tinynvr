@@ -33,6 +33,15 @@ wheels = [
 ]
 
 [[package]]
+name = "asyncinotify"
+version = "4.4.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b3/61/dad12d6ab325c382675c97efde1b3ff194a0c2c6fe3c5618864cba7dad7a/asyncinotify-4.4.2.tar.gz", hash = "sha256:52ad97aa5332dd78592ab9c64171f2953447d98f9170b9bd440c5d19b17d0416", size = 20294, upload-time = "2026-03-30T22:09:03.047Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/30/0f/9c51b9a5fdcf1f82dce3d556839192d6d9d87ea7cac090b82363ebb172ce/asyncinotify-4.4.2-py3-none-any.whl", hash = "sha256:924798f70121d54b313152ef78791d1a70312937e1a2604c4283672fede9d4f4", size = 20095, upload-time = "2026-03-30T22:09:01.581Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -217,6 +226,7 @@ name = "tinynvr"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "asyncinotify" },
     { name = "fastapi" },
     { name = "ruamel-yaml" },
     { name = "uvicorn", extra = ["standard"] },
@@ -224,6 +234,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asyncinotify", specifier = ">=4.4.2" },
     { name = "fastapi" },
     { name = "ruamel-yaml", specifier = ">=0.19.1" },
     { name = "uvicorn", extras = ["standard"] },
