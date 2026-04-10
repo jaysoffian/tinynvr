@@ -922,9 +922,7 @@ function nvr() {
         ]);
         const range = await rangeRes.json();
         if (range.earliest) {
-          // Convert UTC timestamp to local date string for date picker
-          const d = new Date(range.earliest);
-          this.earliestDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+          this.earliestDate = range.earliest;
         }
         const config = await configRes.json();
         if (config.storage?.segment_minutes) {

@@ -82,7 +82,10 @@ async def get_config(request: Request) -> dict:
 
 @app.get("/api/recordings/range")
 async def recordings_range(request: Request) -> dict:
-    """Return the earliest indexed recording date across all cameras."""
+    """Return the earliest indexed recording date across all cameras.
+
+    The date is a UTC ``YYYY-MM-DD`` string, or ``None`` if nothing is indexed.
+    """
     config: Config = request.app.state.config
     storage = Path(config.storage.path)
     if not storage.is_dir():
@@ -96,9 +99,7 @@ async def recordings_range(request: Request) -> dict:
             date_str = idx_file.stem
             if earliest is None or date_str < earliest:
                 earliest = date_str
-    if earliest is None:
-        return {"earliest": None}
-    return {"earliest": f"{earliest}T00:00:00+00:00"}
+    return {"earliest": earliest}
 
 
 @app.get("/api/cameras")
