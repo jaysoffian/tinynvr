@@ -9,10 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
-    """Delete .mkv files older than retention_days based on filename timestamp.
+    """Delete .mkv and .idx files older than retention_days.
 
-    Filenames are like 2026-04-08_02-52-34.mkv (flat, no date subdirectories).
-    Returns the number of files deleted.
+    Segments are named ``YYYY-MM-DD_HH-MM-SS.mkv`` and daily indexes are
+    named ``YYYY-MM-DD.idx``.  Both are keyed by UTC date.  Returns the
+    number of .mkv files deleted.
     """
     root = Path(storage_path)
     if not root.exists():
@@ -24,22 +25,26 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
     for camera_dir in root.iterdir():
         if not camera_dir.is_dir():
             continue
-        for segment in camera_dir.iterdir():
-            if segment.suffix != ".mkv" or not segment.is_file():
+        for entry in camera_dir.iterdir():
+            if not entry.is_file():
                 continue
-            # Parse date from filename: 2026-04-08_02-52-34.mkv
-            try:
-                file_date = date.fromisoformat(segment.stem[:10])
-            except ValueError:
-                continue
-            if file_date < cutoff:
-                segment.unlink()
-                # Also remove .json sidecar if present
-                nfo = segment.with_suffix(".json")
-                if nfo.exists():
-                    nfo.unlink()
-                deleted += 1
-                logger.debug("Deleted old segment: %s", segment)
+            if entry.suffix == ".mkv":
+                try:
+                    file_date = date.fromisoformat(entry.stem[:10])
+                except ValueError:
+                    continue
+                if file_date < cutoff:
+                    entry.unlink()
+                    deleted += 1
+                    logger.debug("Deleted old segment: %s", entry)
+            elif entry.suffix == ".idx":
+                try:
+                    file_date = date.fromisoformat(entry.stem)
+                except ValueError:
+                    continue
+                if file_date < cutoff:
+                    entry.unlink()
+                    logger.debug("Deleted old index: %s", entry)
 
     if deleted > 0:
         logger.info("Retention cleanup: deleted %d segment(s)", deleted)
