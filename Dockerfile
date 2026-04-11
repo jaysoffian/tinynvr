@@ -1,14 +1,18 @@
-FROM python:3.14-alpine AS builder
+FROM alpine:edge AS builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_INSTALL_DIR=/usr/local/share/uv-python \
+    UV_PYTHON_BIN_DIR=/usr/local/bin
 WORKDIR /app
+RUN uv python install 3.14
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY tinynvr/ tinynvr/
 COPY static/ static/
 RUN uv sync --frozen --no-dev
 
-FROM python:3.14-alpine
+FROM alpine:edge
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.source="https://github.com/jaysoffian/tinynvr" \
       org.opencontainers.image.revision="$GIT_COMMIT" \
@@ -16,6 +20,7 @@ LABEL org.opencontainers.image.source="https://github.com/jaysoffian/tinynvr" \
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=builder /app /app
+COPY --from=builder /usr/local /usr/local
 RUN printf '%s' "$GIT_COMMIT" > /app/VERSION
 ENV PATH="/app/.venv/bin:$PATH" TINYNVR_CONFIG=/config/config.yaml
 VOLUME ["/config", "/recordings"]
