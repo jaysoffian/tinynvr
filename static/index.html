@@ -347,6 +347,20 @@ html, body {
   background: var(--red);
   transform: translateX(-1px);
 }
+.timeline-hover-tooltip {
+  position: absolute;
+  top: -14px;
+  transform: translateX(-50%);
+  font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 10px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 1px 4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
 
 /* Click overlay for scrubbing - covers tracks + hours */
 .timeline-click-overlay {
@@ -805,11 +819,18 @@ html, body {
         <div class="timeline-cursor-line"
              :style="'left:' + cursorPercent + '%'">
         </div>
+        <div class="timeline-hover-tooltip"
+             x-show="hoverPct !== null"
+             x-cloak
+             :style="'left:' + hoverPct + '%'"
+             x-text="hoverTimeDisplay"></div>
       </div>
       <!-- Invisible click overlay for scrubbing -->
       <div class="timeline-click-overlay"
            @mousedown.prevent="startScrubOrSelect($event)"
+           @mousemove="onTimelineHover($event)"
            @mousemove.window="doScrub($event)"
+           @mouseleave="hoverPct = null"
            @mouseup.window="endScrub()"
            @touchstart.prevent="startScrub($event)"
            @touchmove.window="doScrub($event.touches[0])"
@@ -857,6 +878,8 @@ function nvr() {
     earliestDate: null,
     version: '',
     canGoBack: true,
+    hoverPct: null,    // 0-100 timeline position during hover, null when not hovering
+    hoverTime: null,   // Date at hover position
     selectionStart: null,  // Date object
     selectionEnd: null,    // Date object
     downloadingCam: null,   // camera name currently downloading, or null
@@ -1525,6 +1548,20 @@ function nvr() {
       this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
       this._clampWallTime();
       this.loadSegmentsForAll();
+    },
+
+    onTimelineHover(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const frac = x / rect.width;
+      this.hoverPct = frac * 100;
+      this.hoverTime = new Date(this._startOfDay().getTime() + frac * this._dayLengthMs());
+    },
+
+    get hoverTimeDisplay() {
+      if (!this.hoverTime) return '';
+      const d = this.hoverTime;
+      return String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
     },
 
     // -- Fullscreen scrubbing --
