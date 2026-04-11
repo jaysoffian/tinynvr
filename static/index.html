@@ -1648,7 +1648,8 @@ function nvr() {
     get hoverTimeDisplay() {
       if (!this.hoverTime) return '';
       const d = this.hoverTime;
-      return String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
+      return [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map(n => String(n).padStart(2, '0')).join(':');
     },
 
     // -- Fullscreen scrubbing --
