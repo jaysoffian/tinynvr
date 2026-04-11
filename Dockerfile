@@ -13,16 +13,19 @@ COPY static/ static/
 RUN uv sync --frozen --no-dev
 
 FROM alpine:edge
-ARG GIT_COMMIT=unknown
-LABEL org.opencontainers.image.source="https://github.com/jaysoffian/tinynvr" \
-      org.opencontainers.image.revision="$GIT_COMMIT" \
-      org.opencontainers.image.title="TinyNVR"
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=builder /app /app
 COPY --from=builder /usr/local /usr/local
-RUN printf '%s' "$GIT_COMMIT" > /app/VERSION
 ENV PATH="/app/.venv/bin:$PATH" TINYNVR_CONFIG=/config/config.yaml
 VOLUME ["/config", "/recordings"]
 EXPOSE 8554
 CMD ["uvicorn", "tinynvr.app:app", "--host", "0.0.0.0", "--port", "8554"]
+
+# Git commit metadata goes last so rebuilds at a new SHA don't
+# invalidate the expensive apk + venv + Python copy layers above.
+ARG GIT_COMMIT=unknown
+RUN printf '%s' "$GIT_COMMIT" > /app/VERSION
+LABEL org.opencontainers.image.source="https://github.com/jaysoffian/tinynvr" \
+      org.opencontainers.image.revision="$GIT_COMMIT" \
+      org.opencontainers.image.title="TinyNVR"
