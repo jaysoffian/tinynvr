@@ -10,3 +10,4 @@ mise.local.toml
 config.yaml
 recordings/
 tinynvr.tar
+static/alpine.min.js
