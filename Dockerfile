@@ -9,9 +9,14 @@ COPY static/ static/
 RUN uv sync --frozen --no-dev
 
 FROM python:3.14-alpine
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.source="https://github.com/jaysoffian/tinynvr" \
+      org.opencontainers.image.revision="$GIT_COMMIT" \
+      org.opencontainers.image.title="TinyNVR"
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=builder /app /app
+RUN printf '%s' "$GIT_COMMIT" > /app/VERSION
 ENV PATH="/app/.venv/bin:$PATH" TINYNVR_CONFIG=/config/config.yaml
 VOLUME ["/config", "/recordings"]
 EXPOSE 8554

@@ -83,10 +83,23 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 
+_VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
+try:
+    _VERSION = _VERSION_FILE.read_text().strip() or "dev"
+except OSError:
+    _VERSION = "dev"
+
+
 @app.get("/api/config")
 async def get_config(request: Request) -> dict:
     """Return current config as JSON."""
     return config_to_dict(request.app.state.config)
+
+
+@app.get("/api/version")
+async def get_version() -> dict:
+    """Return the short git commit baked into the image at build time."""
+    return {"commit": _VERSION}
 
 
 # ---------------------------------------------------------------------------

@@ -131,6 +131,13 @@ html, body {
   min-width: 70px;
 }
 .topbar .spacer { flex: 1; }
+.topbar .version {
+  font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.6;
+  margin-right: 4px;
+}
 
 /* Main grid */
 .main {
@@ -630,6 +637,7 @@ html, body {
     </select>
     <span class="time-display" x-text="currentTimeDisplay"></span>
     <div class="spacer"></div>
+    <span class="version" x-text="version" x-show="version"></span>
   </div>
 
   <!-- Video grid -->
@@ -847,6 +855,7 @@ function nvr() {
     weekOffset: 0,
     weekDays: [],
     earliestDate: null,
+    version: '',
     canGoBack: true,
     selectionStart: null,  // Date object
     selectionEnd: null,    // Date object
@@ -944,10 +953,17 @@ function nvr() {
 
     async init() {
       try {
-        const rangeRes = await fetch('/api/recordings/range');
+        const [rangeRes, versionRes] = await Promise.all([
+          fetch('/api/recordings/range'),
+          fetch('/api/version'),
+        ]);
         const range = await rangeRes.json();
         if (range.earliest) {
           this.earliestDate = range.earliest;
+        }
+        const version = await versionRes.json();
+        if (version.commit) {
+          this.version = version.commit;
         }
       } catch (e) {}
       this.buildWeek();
