@@ -343,87 +343,85 @@ any future prefetch experiment is tried or reverted.
 
 ### Failed approach #1: HLS
 
-Tried on a deleted branch called `hls`. Two different HLS
-designs were attempted in sequence; the first actually worked
-for the gapless-playback problem and was abandoned for reasons
-unrelated to that goal, and the second exploded under
-complexity.
+Tried on a deleted branch called `hls`, across many hours of
+iteration in sequence with two different HLS designs. **Neither
+one actually worked.**
 
-**First design ("Record to MPEG-TS and
-serve playback via HLS")**. Switched the recorder from
-Matroska to **MPEG-TS** (`-segment_format mpegts`), kept
-per-camera flat layout, kept minute-ish segments. Backend
+**First design**. Switched
+the recorder from Matroska to **MPEG-TS** (`-segment_format
+mpegts`), kept per-camera flat layout, minute-ish segments then
+later 10-second segments in per-day subdirectories. Backend
 emitted an HLS `.m3u8` playlist on demand from a FastAPI
 endpoint that walked the daily `.idx` files for the requested
 range and synthesized the playlist with `EXT-X-PROGRAM-DATE-
 TIME` per segment and `EXT-X-DISCONTINUITY` between
 non-contiguous ones. Segments themselves were served as raw
 `.ts` via `FileResponse`. Frontend used **hls.js** to consume
-the playlist — segment transitions became hls.js appending
-into its internal SourceBuffer, so there was no `video.src`
-change at boundaries and **the flash was gone**. The commit
-message literally says "eliminating the stall at segment
-boundaries." Refinements followed: first shrunk
-segments to 10s in per-day subdirs so playback start was
-faster on high-bitrate cameras, second tagged in-flight
-playlists with `EXT-X-PLAYLIST-TYPE:EVENT` so hls.js stopped
-pinning playback to the live edge and allowed backward seeks.
-So far, so good.
+the playlist.
 
-**Second design**. The
-user decided to drop hls.js and rely on **Safari's native HLS
-engine** instead (`<video src="playlist.m3u8">`). That path
-requires **fragmented MP4 HLS** (`-hls_segment_type fmp4`)
-because Safari's native HLS implementation handles fMP4
-cleanly and MPEG-TS less cleanly, *and* it required a whole
-supporting cast of init-file machinery that fMP4 HLS
-implies:
+Problems actually observed during testing (per the user, after
+hours of iteration on the live deployment):
+
+- **Could not get all four streams to load and play reliably.**
+  Some cameras would come up, others wouldn't, and which ones
+  varied run to run.
+- **When they did all play, they were never in sync** across
+  the 2×2 grid. hls.js managed its own `currentTime` per-
+  element and the shared-wallTime-drives-them-all model that
+  works for plain `<video src=*.mp4>` didn't cleanly map to
+  four independent hls.js instances.
+- **Scrubbing didn't work.** Backward seeks were partially
+  addressed by tagging in-flight playlists with
+  `EXT-X-PLAYLIST-TYPE:EVENT`, but
+  scrubbing within the grid still wasn't reliable.
+
+**Second design**. After
+the first design couldn't be made reliable, the user pivoted to
+**fragmented MP4 HLS via Safari's native `<video
+src="playlist.m3u8">` engine**, dropping hls.js entirely. That
+path requires **fragmented MP4 HLS** (`-hls_segment_type fmp4`)
+and pulled in a 1006-line plan.md full of supporting machinery
+that fMP4 HLS implies:
 
 - Each ffmpeg run writes one `init.mp4` (the fragment init
   segment with the decoder config) plus N `.m4s` media
   fragments. The media fragments reference the init by
   filename via `EXT-X-MAP` in the playlist.
-- When the recorder restarts, the NEW ffmpeg run produces a
-  NEW init (possibly with different track IDs/timescales),
-  so historical segments must be pinned to their original
-  init file forever. The plan introduced a "run-to-init
-  association rule" where each segment's owning init is the
-  newest historical init whose timestamp is ≤ the segment's
-  timestamp.
+- When the recorder restarts, the new ffmpeg run produces a
+  new init (possibly with different track IDs/timescales), so
+  historical segments must be pinned to their original init
+  file forever. The plan introduced a "run-to-init association
+  rule" where each segment's owning init is the newest
+  historical init whose timestamp is ≤ the segment's timestamp.
 - Retention can't delete a historical `init.mp4` until every
-  segment associated with it has been retention-deleted
-  first, otherwise you'd orphan still-live segments. So the
-  retention logic grew to track runs, and `list_runs_all`
-  had to include empty runs.
-- Startup reconciliation after an unclean SIGKILL had to
-  probe the prior run's tail, un-link any truncated segment,
-  and be bounded by a hard 3-segment cap so a broken probe
-  pipeline couldn't mass-delete healthy files.
+  segment associated with it has been retention-deleted first,
+  otherwise you'd orphan still-live segments. So the retention
+  logic grew to track runs.
+- Startup reconciliation after an unclean SIGKILL had to probe
+  the prior run's tail, un-link any truncated segment, and be
+  bounded by a hard 3-segment cap so a broken probe pipeline
+  couldn't mass-delete healthy files.
 - `ffmpeg -strftime 1` didn't expand in the init filename
-  parameter (only in the segment filename), so the recorder
-  had to rename the existing `init.mp4` to
-  `init-<prior_mtime>.mp4` in Python at every start before
-  spawning ffmpeg.
+  parameter (only in the segment filename), so the recorder had
+  to rename the existing `init.mp4` to `init-<prior_mtime>.mp4`
+  in Python at every start before spawning ffmpeg.
 
-The plan.md for this second design ran to 1006 lines. A
-"more flailing" commit and then the "hls plan.md" commit
-are where it was abandoned. The abandonment was about
-complexity, not a specific playback regression that could be
-shown in a debug log — the init-rotation / run-association /
-reconciliation tangle was too much supporting machinery for
-a personal-scale NVR.
+This second design was abandoned partway through, before it
+reached a deployable state. The "hls plan.md" commit is
+literally where it stopped.
 
-**The honest postmortem**: MPEG-TS + hls.js was a working
-gapless solution that we walked away from in pursuit of a
-"no hls.js, Safari-native only" variant that turned out to be
-architecturally much more complex. If the goal is zero-flash
-playback and the user is willing to accept hls.js as a
-dependency and MPEG-TS on disk, design #1 is a known-working
-path. The "Why not HLS?" section above frames HLS as a
-categorical dead end, which is not quite right — design #1
-worked for this problem, design #2 was what didn't work.
+**The honest postmortem**: the `hls` branch ran out of
+energy twice. Not "it worked but we walked away from it" — it
+never had all four cameras reliably playing in sync with
+working scrubbing. Any future HLS attempt has to solve three
+real problems at once: (a) getting 4 hls.js instances (or one
+Safari-native playlist per camera) to load simultaneously
+without racing each other; (b) keeping them time-synchronized
+via the shared wallTime model; (c) making scrubbing work as
+well as the current native-MP4 byte-range path. None of those
+were solved.
 
-### Failed approach #2: Double-buffered `<video>` swap (1a2619f2da → 77518f7b82)
+### Failed approach #2: Double-buffered `<video>` swap
 
 **Theory.** The flash is caused by `video.src = nextUrl` triggering
 a full load cycle, which involves both network fetch and decoder
@@ -580,8 +578,7 @@ test (null check) and started a second fetch. Small memory leak
 per duplicate blob, doubled prefetch bandwidth. Latent bug, but
 not the primary cause of the flash.
 
-**Outcome.** Reverted. Restored plain
-`video.src = httpUrl` with no prefetch.
+**Outcome.** Reverted. Restored plain `video.src = httpUrl` with no prefetch.
 
 ### Still on the table, not yet tried
 
