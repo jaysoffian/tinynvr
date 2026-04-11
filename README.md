@@ -16,6 +16,13 @@ layout, recording/playback pipelines, and the reasoning against HLS.
 - Linux (uses inotify to index segments as ffmpeg finishes writing them)
 - [mise](https://mise.jdx.dev) (installs uv and prek)
 - ffmpeg
+- **RTSP streams must be H.264 video + AAC audio.** The recorder is
+  pure stream copy (`-c copy`) and writes MP4 segments; anything
+  other than H.264+AAC will fail to mux. The expected deployment is
+  behind [go2rtc](https://github.com/AlexxIT/go2rtc) with its `?mp4`
+  stream variant, which normalizes camera streams to H.264+AAC for
+  you — point TinyNVR at the go2rtc RTSP URLs, not at the cameras
+  directly.
 
 ## Quick start
 
