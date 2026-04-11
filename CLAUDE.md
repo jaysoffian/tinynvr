@@ -32,6 +32,9 @@ a "Why not HLS?" rationale.
   the specific regressions that killed the HLS branch.
 - `SEGMENT_SECONDS` is fixed at 60 and intentionally not
   configurable — see README.md "Why 1-minute segments".
-- Gapless playback is achieved via double-buffered `<video>` swap
-  in `static/index.html`, not via any streaming protocol. See
-  DESIGN.md "Playback pipeline".
+- Playback uses a single `<video>` element per camera. A
+  double-buffered swap was explored and reverted because it broke
+  Safari with 4 cameras. See DESIGN.md "Frontend: single <video>
+  per panel" before proposing a gapless-playback change — the
+  current small hitch at segment boundaries is a deliberate
+  trade-off, not an unsolved bug.

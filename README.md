@@ -4,7 +4,6 @@ A lightweight, self-hosted NVR that records RTSP camera streams and provides a w
 
 - Records via ffmpeg with no video transcoding (`-c:v copy`), near-zero CPU
 - 1-minute self-contained MP4 segments with `moov` at front for instant byte-range scrubbing
-- Gapless playback across segment boundaries (double-buffered `<video>`, tested against Safari's preload hedging)
 - Synced multi-camera grid with a 24-hour timeline that handles DST transitions
 - Rolling retention (configurable, default 7 days)
 - HomeAssistant webhook to toggle cameras on/off

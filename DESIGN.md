@@ -109,40 +109,43 @@ whichever segment covers it.
   show 23 ticks (spring ahead, one hour absent) or 25 ticks (fall
   back, one hour repeated) instead of misaligned labels.
 
-### Frontend: double-buffered gapless playback
+### Frontend: single `<video>` per panel
 
-Each camera panel renders **two `<video>` elements**, absolutely
-positioned in the same slot, with an `.active` opacity class driven
-by a per-camera `activeSlot` ('a' | 'b') in `camStates`:
+Each camera panel renders **one `<video>` element**. When the
+segment ends, `onended` fires, `_onSegmentEnd` advances `wallTime`
+to the next segment's start, and `loadSegmentForCamera` sets
+`video.src = nextUrl`, which triggers `loadedmetadata` and
+playback resumes. There's a ~100–300ms gap at each segment
+boundary while the browser fetches, parses, and decodes the new
+file. For a 1-minute segment length that's a minor hitch once per
+minute, which is acceptable.
 
-- **Active slot** plays the current segment, visible.
-- **Pending slot** holds the next segment, hidden, primed for an
-  instant swap.
+During that gap, `loadSegmentForCamera`'s `!found` branch used to
+unconditionally clear the `<video>` element if `findSegmentAt`
+returned null at the current wallTime — which happened for any
+camera whose segments had a sub-second rotation drift or a
+failed/missing segment at the transition moment. That produced a
+brief "Offline" overlay flash. Now, during live playback (`this.playing
+=== true`), the `!found` branch returns silently: the last frame
+stays visible and the free-running clock advances wallTime out of
+the gap, so the next tick finds a real segment and resumes
+playback without ever clearing the video element.
 
-When the active segment's `onended` fires, `loadSegmentForCamera`
-finds the new current segment and detects that the pending slot
-already has it — so the transition is just `state.activeSlot =
-otherSlot`, which flips the `.active` class and calls `.play()` on
-the now-visible element. No network fetch, no `loadedmetadata`
-wait, no black frame. The old active (now pending) gets primed with
-the segment after the new current.
+Two architectures that were explored and rejected:
 
-Safari hedges aggressively on `preload="auto"` for hidden `<video>`
-elements — it often fetches only metadata until the element becomes
-visible. `_preloadPending` works around this with three redundant
-primers:
-
-1. **`#t=0.001` URL fragment** — the Media Fragments URI spec tells
-   the browser to seek to that offset during load, which forces it
-   to fetch past metadata into the first GOP.
-2. **`currentTime = 0.001` on `loadedmetadata`** — redundant seek
-   via JS. Some Safari versions respond to one but not the other.
-3. **Brief muted `play()` then `pause()`** — aggressive last resort
-   to force Safari to actually start decoding.
-
-The three together mean that by the time a segment boundary is
-reached, the pending video is fully decoded and pre-rendered to its
-first frame, so the opacity swap is seamless.
+- **Double-buffered `<video>` swap**. Two video elements per panel
+  with opacity-based visibility, pending slot primed with the
+  segment after current. Worked fine with one camera but broke with
+  four on Safari: the preload primer (URL fragment + seek + muted
+  play/pause) produced a flurry of canceled byte-range fetches
+  visible in the Web Inspector Network panel, one camera (the
+  doorbell) started showing a cropped frame after a few scrubs,
+  and the other feeds struggled intermittently. Safari's
+  combination of hidden-element preload hedging and per-element
+  decoder state made doubling the video element count from 4 to 8
+  a net loss. See git history for commits `1a2619f2da` (add) and
+  `77518f7b82` (revert).
+- **HLS / fragmented MP4**. See "Why not HLS?" below.
 
 ## Retention
 
@@ -261,21 +264,20 @@ The adaptive-streaming machinery — playlist generation, init
 segments, segment numbering, discontinuity tags, manifest refresh
 intervals, hls.js as a ~1MB JS dependency — is all dead weight.
 
-### Double-buffering gives us gapless without any of that
+### The goal was gapless — we accepted a small hitch instead
 
 The actual goal of the HLS detour was *gapless playback across
-segment boundaries*. It turns out we can get that with a much
-smaller change: render two `<video>` elements per panel, keep one
-primed with the next segment, and opacity-swap on `onended`. No
-fragmented MP4, no manifest, no new libraries, no byte-range
-regression. Just ~150 lines of Alpine.js and a CSS class.
-
-The result: byte-range scrubbing still works unchanged (Safari
-seeks directly into any segment via HTTP `Range:`), segment
-transitions are gapless (primed pending slot becomes visible in
-one paint cycle), and the recorder config stays at
-`-segment_format mp4 -segment_format_options movflags=+faststart`
-— simple, testable, debuggable.
+segment boundaries*. We didn't find a way to achieve that in
+Safari without breaking something else. A double-buffered
+`<video>` approach (two elements per panel, opacity swap, pending
+slot preloaded) worked for single-camera apps but misbehaved in
+a 4-camera grid — see the "Frontend: single `<video>` per panel"
+section above for details. So the shipped design accepts a
+~100–300ms load hitch at segment boundaries and keeps the
+recorder config and storage format untouched. Byte-range scrubbing
+still works unchanged (Safari seeks directly into any segment via
+HTTP `Range:`), which was the original bug that motivated all
+this work anyway.
 
 ### What would bring HLS back
 
