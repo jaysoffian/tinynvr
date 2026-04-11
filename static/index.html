@@ -764,9 +764,16 @@ html, body {
               <div class="timeline-selection" x-show="selectionStart && selectionEnd" x-cloak
                    :style="selectionStyle()"></div>
               <div class="fs-timeline-cursor" :style="'left:' + cursorPercent + '%'"></div>
+              <div class="timeline-hover-tooltip"
+                   x-show="hoverPct !== null"
+                   x-cloak
+                   :style="'left:' + hoverPct + '%'"
+                   x-text="hoverTimeDisplay"></div>
               <div class="fs-timeline-click"
                    @mousedown.prevent="startFsScrubOrSelect($event)"
+                   @mousemove="onTimelineHover($event)"
                    @mousemove.window="doFsScrub($event)"
+                   @mouseleave="hoverPct = null"
                    @mouseup.window="endFsScrub()"
                    @touchstart.prevent="startFsScrub($event)"
                    @touchmove.window="doFsScrub($event.touches[0])"
