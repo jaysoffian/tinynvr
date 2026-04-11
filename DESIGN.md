@@ -43,19 +43,21 @@ a local NAS, not for multi-tenant or cloud deployment.
 
 ```
 ffmpeg -rtsp_transport tcp -use_wallclock_as_timestamps 1 -i <rtsp> \
-  -c:v copy -c:a aac -b:a 128k \
+  -c copy \
   -f segment -segment_time 60 -reset_timestamps 1 \
   -segment_format mp4 -segment_format_options movflags=+faststart \
   -segment_atclocktime 1 -strftime 1 \
   {camera}/%Y-%m-%d_%H-%M-%S.mp4
 ```
 
-- **Video is never transcoded** (`-c:v copy`). RTSP cameras already
-  emit H.264; CPU cost is effectively zero.
-- **Audio is re-encoded to AAC** (`-c:a aac -b:a 128k`). MP4 cannot
-  carry `pcm_mulaw` or most other audio codecs that IP cameras emit.
-  We pay this CPU cost once at record time instead of on every
-  playback request.
+- **Nothing is ever transcoded** (`-c copy`). go2rtc is the upstream
+  and is expected to normalize each camera to H.264 + AAC before
+  TinyNVR sees it (the user does this via the `?mp4` stream variant
+  in go2rtc's stream URLs). Recording is pure stream copy — CPU cost
+  is effectively zero. If you're pointing TinyNVR at an RTSP source
+  that emits `pcm_mulaw` or another non-MP4 audio codec directly,
+  segments will fail to mux; fix the upstream, don't add an encode
+  step here.
 - **`-segment_atclocktime 1`** aligns segment boundaries to minute
   boundaries on the wall clock, so segments across cameras are
   roughly synchronized. They still drift by up to 1 minute because
