@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
-    """Delete .mkv and .idx files older than retention_days.
+    """Delete .mp4 and .idx files older than retention_days.
 
-    Segments are named ``YYYY-MM-DD_HH-MM-SS.mkv`` and daily indexes are
+    Segments are named ``YYYY-MM-DD_HH-MM-SS.mp4`` and daily indexes are
     named ``YYYY-MM-DD.idx``.  Both are keyed by UTC date.  Returns the
-    number of .mkv files deleted.
+    number of .mp4 files deleted.
     """
     root = Path(storage_path)
     if not root.exists():
@@ -28,7 +28,7 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
         for entry in camera_dir.iterdir():
             if not entry.is_file():
                 continue
-            if entry.suffix == ".mkv":
+            if entry.suffix == ".mp4":
                 try:
                     file_date = date.fromisoformat(entry.stem[:10])
                 except ValueError:

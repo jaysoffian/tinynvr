@@ -49,7 +49,7 @@ class CameraRecorder:
         return Path(self.storage.path) / self.name
 
     def _build_ffmpeg_args(self) -> list[str]:
-        output_pattern = str(self.output_dir / "%Y-%m-%d_%H-%M-%S.mkv")
+        output_pattern = str(self.output_dir / "%Y-%m-%d_%H-%M-%S.mp4")
         return [
             "ffmpeg",
             "-hide_banner",
@@ -63,8 +63,12 @@ class CameraRecorder:
             "10000000",
             "-i",
             self.camera.url,
-            "-c",
+            "-c:v",
             "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
             "-metadata",
             f"title={self.name}",
             "-f",
@@ -74,7 +78,9 @@ class CameraRecorder:
             "-segment_time",
             str(self.storage.segment_minutes * 60),
             "-segment_format",
-            "matroska",
+            "mp4",
+            "-segment_format_options",
+            "movflags=+faststart",
             "-segment_atclocktime",
             "1",
             "-strftime",
@@ -130,14 +136,16 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
-    async def _index_segment(self, mkv: Path) -> None:
+    async def _index_segment(self, segment: Path) -> None:
         try:
-            dur = await append_duration(self.output_dir, mkv)
+            dur = await append_duration(self.output_dir, segment)
         except Exception:
-            logger.exception("Failed to index segment %s for %s", mkv.name, self.name)
+            logger.exception(
+                "Failed to index segment %s for %s", segment.name, self.name
+            )
             return
         if dur is not None:
-            logger.info("Indexed %s for %s (%.1fs)", mkv.name, self.name, dur)
+            logger.info("Indexed %s for %s (%.1fs)", segment.name, self.name, dur)
 
     async def _watcher_loop(self) -> None:
         """Append each finished segment's duration to its daily .idx file.
@@ -156,7 +164,7 @@ class CameraRecorder:
                 inotify.add_watch(self.output_dir, Mask.CLOSE_WRITE)
                 async for event in inotify:
                     path = event.path
-                    if path is None or path.suffix != ".mkv":
+                    if path is None or path.suffix != ".mp4":
                         continue
                     task = asyncio.create_task(
                         self._index_segment(self.output_dir / path.name)

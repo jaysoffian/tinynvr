@@ -3,8 +3,8 @@
 Each camera directory contains one ``{YYYY-MM-DD}.idx`` per UTC day — a
 simple append-only text file with one entry per line::
 
-    2026-04-10_12-00-00.mkv: 600.0
-    2026-04-10_12-10-00.mkv: 0
+    2026-04-10_12-00-00.mp4: 600.0
+    2026-04-10_12-10-00.mp4: 0
 
 Failed probes are recorded as ``0`` so corrupt/incomplete segments
 aren't re-probed.  When a filename appears more than once (recovery
@@ -32,9 +32,9 @@ def index_path(camera_dir: Path, date_str: str) -> Path:
     return camera_dir / f"{date_str}.idx"
 
 
-def _date_from_mkv(mkv: Path) -> str | None:
+def _date_from_segment(segment: Path) -> str | None:
     """Extract YYYY-MM-DD from a segment filename."""
-    stem = mkv.stem  # expects "YYYY-MM-DD_HH-MM-SS"
+    stem = segment.stem  # expects "YYYY-MM-DD_HH-MM-SS"
     if len(stem) < 10 or stem[4] != "-" or stem[7] != "-":
         return None
     return stem[:10]
@@ -68,7 +68,7 @@ def read_indexes(camera_dir: Path, date_strs: list[str]) -> dict[str, float]:
     return merged
 
 
-async def _probe_duration(mkv: Path) -> float | None:
+async def _probe_duration(segment: Path) -> float | None:
     """Probe a single file with ffprobe. Returns ``None`` on failure."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -78,7 +78,7 @@ async def _probe_duration(mkv: Path) -> float | None:
             "-print_format",
             "json",
             "-show_format",
-            str(mkv),
+            str(segment),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -90,46 +90,46 @@ async def _probe_duration(mkv: Path) -> float | None:
         if raw is None:
             return None
         dur = min(float(raw), _MAX_DURATION)
-        logger.debug("ffprobe %s: %.3fs", mkv, dur)
+        logger.debug("ffprobe %s: %.3fs", segment, dur)
         return dur
     except (ValueError, OSError) as exc:
-        logger.warning("ffprobe errored for %s: %s", mkv, exc)
+        logger.warning("ffprobe errored for %s: %s", segment, exc)
         return None
 
 
-def _unlink_unplayable(mkv: Path) -> None:
+def _unlink_unplayable(segment: Path) -> None:
     """Remove a segment that ffprobe could not read."""
     try:
-        mkv.unlink()
+        segment.unlink()
     except OSError as exc:
-        logger.warning("Failed to delete unplayable %s: %s", mkv, exc)
+        logger.warning("Failed to delete unplayable %s: %s", segment, exc)
         return
-    logger.info("Deleted unplayable segment %s", mkv)
+    logger.info("Deleted unplayable segment %s", segment)
 
 
 def _append_entry(camera_dir: Path, filename: str, duration: float) -> None:
     """Append a single ``FILENAME: duration`` line to the matching daily index."""
-    date_str = _date_from_mkv(Path(filename))
+    date_str = _date_from_segment(Path(filename))
     if date_str is None:
         return
     with index_path(camera_dir, date_str).open("a") as f:
         f.write(f"{filename}: {round(duration, 3)}\n")
 
 
-async def append_duration(camera_dir: Path, mkv: Path) -> float | None:
+async def append_duration(camera_dir: Path, segment: Path) -> float | None:
     """Probe one completed segment and append its duration to the daily index.
 
     Unplayable segments are deleted and not indexed.  Returns the probed
     duration in seconds, or ``None`` if the segment was unplayable or
     the filename isn't a valid segment name.
     """
-    if _date_from_mkv(mkv) is None:
+    if _date_from_segment(segment) is None:
         return None
-    dur = await _probe_duration(mkv)
+    dur = await _probe_duration(segment)
     if dur is None:
-        _unlink_unplayable(mkv)
+        _unlink_unplayable(segment)
         return None
-    _append_entry(camera_dir, mkv.name, dur)
+    _append_entry(camera_dir, segment.name, dur)
     return dur
 
 
@@ -144,13 +144,13 @@ async def validate_indexes(camera_dir: Path) -> None:
         return
 
     by_date: dict[str, list[Path]] = {}
-    for mkv in camera_dir.glob("*.mkv"):
-        if not mkv.is_file():
+    for segment in camera_dir.glob("*.mp4"):
+        if not segment.is_file():
             continue
-        date_str = _date_from_mkv(mkv)
+        date_str = _date_from_segment(segment)
         if date_str is None:
             continue
-        by_date.setdefault(date_str, []).append(mkv)
+        by_date.setdefault(date_str, []).append(segment)
 
     if not by_date:
         return
@@ -163,9 +163,9 @@ async def validate_indexes(camera_dir: Path) -> None:
 
     total = 0
     deleted = 0
-    for date_str, mkvs in sorted(by_date.items()):
+    for date_str, segments in sorted(by_date.items()):
         known = read_index(camera_dir, date_str)
-        to_probe = [m for m in mkvs if m.name not in known]
+        to_probe = [s for s in segments if s.name not in known]
         if not to_probe:
             continue
         logger.info(
@@ -176,12 +176,12 @@ async def validate_indexes(camera_dir: Path) -> None:
         )
         results = await asyncio.gather(*(_probe(p) for p in to_probe))
         with index_path(camera_dir, date_str).open("a") as f:
-            for mkv, dur in results:
+            for segment, dur in results:
                 if dur is None:
-                    _unlink_unplayable(mkv)
+                    _unlink_unplayable(segment)
                     deleted += 1
                     continue
-                f.write(f"{mkv.name}: {round(dur, 3)}\n")
+                f.write(f"{segment.name}: {round(dur, 3)}\n")
                 f.flush()
                 total += 1
 

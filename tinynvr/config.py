@@ -19,7 +19,7 @@ _SEED_CONFIG = """\
 storage:
   path: /recordings
   retention_days: 7
-  segment_minutes: 5    # 1-60
+  segment_minutes: 1    # 1-60
 
 cameras:
   # example:
@@ -32,7 +32,7 @@ cameras:
 class StorageConfig:
     path: str = "./recordings"
     retention_days: int = 7
-    segment_minutes: int = 5
+    segment_minutes: int = 1
 
 
 @dataclass
@@ -57,8 +57,8 @@ def _parse_camera(data: dict[str, Any]) -> CameraConfig:
 
 
 def _parse_storage(data: dict[str, Any]) -> StorageConfig:
-    segment_minutes = max(1, min(60, data.get("segment_minutes", 5)))
-    raw_value = data.get("segment_minutes", 5)
+    segment_minutes = max(1, min(60, data.get("segment_minutes", 1)))
+    raw_value = data.get("segment_minutes", 1)
     if raw_value != segment_minutes:
         logger.warning(
             "segment_minutes=%d out of range 1-60, clamped to %d",

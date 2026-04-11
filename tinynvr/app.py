@@ -14,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import FileResponse, StreamingResponse
 
 from tinynvr.config import (
     Config,
@@ -180,6 +180,8 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
 
     segments = []
     for filename, duration_sec in sorted(durations.items()):
+        if not filename.endswith(".mp4"):
+            continue
         try:
             start_time = (
                 datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S")
@@ -204,82 +206,31 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
     return segments
 
 
-async def _wait_for_disconnect(request: Request) -> None:
-    """Resolve when the client closes the connection."""
-    while not await request.is_disconnected():
-        await asyncio.sleep(0.5)
-
-
 @app.get("/api/segments/{camera_name}/{filename}")
 async def serve_segment(
     camera_name: str,
     filename: str,
     request: Request,
-    download: bool = False,
-) -> Response:
-    """Serve a segment by remuxing MKV to fMP4 for browser playback."""
+) -> FileResponse:
+    """Serve a segment file statically.
+
+    Segments are self-contained MP4 with the moov atom at the start,
+    so Starlette's FileResponse handles Range: requests natively and
+    Safari can byte-range seek into the middle of a segment.
+    """
     config: Config = request.app.state.config
     storage = Path(config.storage.path).resolve()
     file_path = (storage / camera_name / filename).resolve()
 
     if not file_path.is_relative_to(storage) or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Segment not found")
+    if file_path.suffix != ".mp4":
+        raise HTTPException(status_code=404, detail="Segment not found")
 
-    # Remux MKV → fMP4: video copy, audio transcode to AAC (for pcm_mulaw etc.)
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(file_path),
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-movflags",
-        "+frag_keyframe+empty_moov+default_base_moof",
-        "-f",
-        "mp4",
-        "pipe:1",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-
-    # Race ffmpeg against client disconnect so we kill the process
-    # if the browser moves to a different segment during scrubbing
-    comm_task = asyncio.create_task(proc.communicate())
-    disc_task = asyncio.create_task(_wait_for_disconnect(request))
-    try:
-        done, _ = await asyncio.wait(
-            {comm_task, disc_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-    finally:
-        disc_task.cancel()
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        if not comm_task.done():
-            comm_task.cancel()
-
-    if comm_task not in done:
-        return Response(status_code=499)
-
-    stdout, _ = comm_task.result()
-
-    if proc.returncode != 0:
-        logger.warning("Remux failed for %s, deleting", file_path)
-        with contextlib.suppress(OSError):
-            file_path.unlink()
-        raise HTTPException(status_code=404, detail="Segment unplayable")
-
-    # Sanitize filename for Content-Disposition header
-    safe_name = re.sub(r"[^\w.\-]", "_", filename.replace(".mkv", ".mp4"))
-    disposition = "attachment" if download else "inline"
-    return Response(
-        content=stdout,
+    return FileResponse(
+        file_path,
         media_type="video/mp4",
-        headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"'},
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
 
 
@@ -332,6 +283,8 @@ async def download_range(
     matching: list[tuple[datetime, Path, float]] = []
     for filename, dur in sorted(durations.items()):
         if dur <= 0:
+            continue
+        if not filename.endswith(".mp4"):
             continue
         p = camera_dir / filename
         if not p.resolve().is_relative_to(storage):
