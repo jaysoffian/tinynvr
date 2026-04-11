@@ -341,87 +341,95 @@ day (real offline) vs. a transient gap (still loading).
 This is orthogonal to the prefetch story and should stay even if
 any future prefetch experiment is tried or reverted.
 
-### Failed approach #1: HLS
+### Failed approach #1: HLS (MPEG-TS + hls.js)
 
 Tried on a deleted branch called `hls`, across many hours of
-iteration in sequence with two different HLS designs. **Neither
-one actually worked.**
+live iteration on the four-camera deployment. **The tried
+design did not work.**
 
-**First design**. Switched
-the recorder from Matroska to **MPEG-TS** (`-segment_format
-mpegts`), kept per-camera flat layout, minute-ish segments then
-later 10-second segments in per-day subdirectories. Backend
-emitted an HLS `.m3u8` playlist on demand from a FastAPI
-endpoint that walked the daily `.idx` files for the requested
-range and synthesized the playlist with `EXT-X-PROGRAM-DATE-
-TIME` per segment and `EXT-X-DISCONTINUITY` between
-non-contiguous ones. Segments themselves were served as raw
-`.ts` via `FileResponse`. Frontend used **hls.js** to consume
-the playlist.
+**What was actually implemented**. The recorder switched from Matroska to
+**MPEG-TS** via ffmpeg's segment muxer, *not* the HLS muxer:
 
-Problems actually observed during testing (per the user, after
-hours of iteration on the live deployment):
+```
+-c copy \
+-f segment -segment_format mpegts -segment_time 10 \
+-strftime 1 {camera}/%Y-%m-%d/%Y-%m-%d_%H-%M-%S.ts
+```
+
+Segments were flat-ish `.ts` files (10 seconds each, in per-day
+UTC subdirs). On the backend, a FastAPI endpoint synthesized an
+HLS `.m3u8` playlist on demand from the daily `.idx` duration
+files, emitting `EXT-X-PROGRAM-DATE-TIME` per segment and
+`EXT-X-DISCONTINUITY` between non-contiguous ones, with
+`EXT-X-PLAYLIST-TYPE:EVENT` on in-progress ranges so hls.js
+wouldn't pin to the live edge. Segments were served raw via
+`FileResponse`. Frontend used **hls.js** (not Safari's native
+HLS player) to consume the playlist.
+
+**This is classic HLS over MPEG-TS, not fragmented MP4.** The
+two are completely different on-disk formats. MPEG-TS (`.ts`)
+is a transport stream with PAT/PMT/PES packets, self-contained
+per segment. Fragmented MP4 (`.m4s` + separate `init.mp4`) uses
+`moof`/`mdat` box structure and references a shared init
+segment via `EXT-X-MAP`. They require different ffmpeg muxers
+(`-f segment -segment_format mpegts` vs `-f hls
+-hls_segment_type fmp4`) and different playlist semantics.
+
+Problems observed during testing (per the user, after hours of
+live iteration):
 
 - **Could not get all four streams to load and play reliably.**
   Some cameras would come up, others wouldn't, and which ones
   varied run to run.
 - **When they did all play, they were never in sync** across
-  the 2×2 grid. hls.js managed its own `currentTime` per-
-  element and the shared-wallTime-drives-them-all model that
-  works for plain `<video src=*.mp4>` didn't cleanly map to
-  four independent hls.js instances.
-- **Scrubbing didn't work.** Backward seeks were partially
-  addressed by tagging in-flight playlists with
-  `EXT-X-PLAYLIST-TYPE:EVENT`, but
-  scrubbing within the grid still wasn't reliable.
+  the 2×2 grid. The shared-wallTime-drives-all-cameras model
+  that works cleanly with plain `<video src=*.mp4>` didn't map
+  naturally onto four independent hls.js instances, each with
+  its own internal buffer and `currentTime`.
+- **Scrubbing didn't work.** Tagging in-flight playlists with
+  `EXT-X-PLAYLIST-TYPE:EVENT` got backward seeks into a
+  partially-working state, but grid-wide scrubbing never
+  became reliable.
 
-**Second design**. After
-the first design couldn't be made reliable, the user pivoted to
-**fragmented MP4 HLS via Safari's native `<video
-src="playlist.m3u8">` engine**, dropping hls.js entirely. That
-path requires **fragmented MP4 HLS** (`-hls_segment_type fmp4`)
-and pulled in a 1006-line plan.md full of supporting machinery
-that fMP4 HLS implies:
+Which of these are inherent to HLS-via-hls.js vs fixable with
+more iteration is unclear. The branch ran out of energy before
+any of them was definitively solved or definitively shown to
+be unsolvable.
 
-- Each ffmpeg run writes one `init.mp4` (the fragment init
-  segment with the decoder config) plus N `.m4s` media
-  fragments. The media fragments reference the init by
-  filename via `EXT-X-MAP` in the playlist.
-- When the recorder restarts, the new ffmpeg run produces a
-  new init (possibly with different track IDs/timescales), so
-  historical segments must be pinned to their original init
-  file forever. The plan introduced a "run-to-init association
-  rule" where each segment's owning init is the newest
-  historical init whose timestamp is ≤ the segment's timestamp.
-- Retention can't delete a historical `init.mp4` until every
-  segment associated with it has been retention-deleted first,
-  otherwise you'd orphan still-live segments. So the retention
-  logic grew to track runs.
-- Startup reconciliation after an unclean SIGKILL had to probe
-  the prior run's tail, un-link any truncated segment, and be
-  bounded by a hard 3-segment cap so a broken probe pipeline
-  couldn't mass-delete healthy files.
-- `ffmpeg -strftime 1` didn't expand in the init filename
-  parameter (only in the segment filename), so the recorder had
-  to rename the existing `init.mp4` to `init-<prior_mtime>.mp4`
-  in Python at every start before spawning ffmpeg.
+**Fragmented MP4 HLS was planned but never implemented.** After
+the MPEG-TS iteration stalled with "hls
+plan.md" wrote a 1006-line plan to pivot away from hls.js and
+onto **Safari's native `<video src="playlist.m3u8">` player**
+with `-hls_segment_type fmp4`. That plan introduced supporting
+machinery appropriate for fMP4 HLS: one `init.mp4` per ffmpeg
+run, a run-to-init association rule (each segment's owning
+init is the newest historical init ≤ its timestamp), retention
+that kept historical inits alive until all their segments were
+deleted, startup reconciliation with a bounded unlink cap, and
+Python-side init file rotation because `-strftime 1` doesn't
+expand in the init filename parameter. None of this was coded
+— the recorder.py at the tip of `hls` still outputs
+MPEG-TS via the segment muxer. The branch was simply
+abandoned with the plan sitting there.
 
-This second design was abandoned partway through, before it
-reached a deployable state. The "hls plan.md" commit is
-literally where it stopped.
+**What this means for future attempts**:
 
-**The honest postmortem**: the `hls` branch ran out of
-energy twice. Not "it worked but we walked away from it" — it
-never had all four cameras reliably playing in sync with
-working scrubbing. Any future HLS attempt has to solve three
-real problems at once: (a) getting 4 hls.js instances (or one
-Safari-native playlist per camera) to load simultaneously
-without racing each other; (b) keeping them time-synchronized
-via the shared wallTime model; (c) making scrubbing work as
-well as the current native-MP4 byte-range path. None of those
-were solved.
+- **MPEG-TS + hls.js failed on a known set of problems** (4-
+  stream load reliability, cross-stream sync under shared
+  wallTime, scrub reliability). A future attempt has to solve
+  those three problems concretely, not assume they're
+  superficial.
+- **fMP4 HLS via Safari's native player is untested**. It
+  might work where MPEG-TS + hls.js didn't — Safari's native
+  HLS implementation is more mature than hls.js, and
+  native-player sync could conceivably be better than
+  independent hls.js instances. It also might not, and the
+  init-file / retention / reconciliation complexity is real.
+  Worth considering if the flash becomes intolerable, *not*
+  worth jumping into without scoping how much of the 1000-
+  line plan is actually necessary vs. written under pressure.
 
-### Failed approach #2: Double-buffered `<video>` swap
+### Failed approach #2: Double-buffered `<video>` swap (1a2619f2da → 77518f7b82)
 
 **Theory.** The flash is caused by `video.src = nextUrl` triggering
 a full load cycle, which involves both network fetch and decoder
@@ -473,7 +481,7 @@ dominates.
 **Outcome.** Reverted. Single `<video>` per camera. The flash came
 back but the doorbell stayed un-cropped.
 
-### Failed approach #3: HTTP cache prefetch via `fetch().blob()`
+### Failed approach #3: HTTP cache prefetch via `fetch().blob()` (f14e2b177d → da2c41a1f6)
 
 **Theory.** Suggested by a second-opinion research agent as a
 fallback to double-buffering. The single `<video>` element stays,
@@ -518,7 +526,7 @@ earlier.
 ~double the network cost for zero playback benefit. Removed in
 the same revert as approach #4.
 
-### Failed approach #4: Blob-URL prefetch
+### Failed approach #4: Blob-URL prefetch (cf6d1b8c14 → da2c41a1f6)
 
 **Theory.** If Safari's HTTP cache isn't shared with `<video>`,
 bypass the cache entirely. Keep the `fetch()` prefetch, but
@@ -578,7 +586,8 @@ test (null check) and started a second fetch. Small memory leak
 per duplicate blob, doubled prefetch bandwidth. Latent bug, but
 not the primary cause of the flash.
 
-**Outcome.** Reverted. Restored plain `video.src = httpUrl` with no prefetch.
+**Outcome.** Reverted. `da2c41a1f6` restores plain
+`video.src = httpUrl` with no prefetch.
 
 ### Still on the table, not yet tried
 
