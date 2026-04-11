@@ -1106,10 +1106,35 @@ function nvr() {
       return latest;
     },
 
+    _earliestStart() {
+      // Find the earliest playable segment start across all cameras.
+      let earliest = Infinity;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        for (const seg of segs) {
+          if (seg.duration_sec > 0) {
+            const start = this._parseStart(seg).getTime();
+            if (start < earliest) earliest = start;
+            break;
+          }
+        }
+      }
+      return earliest === Infinity ? 0 : earliest;
+    },
+
     _clampWallTime() {
+      // Keep wallTime inside the playable range so scrubbing past either
+      // end lands on a position where findSegmentAt actually returns a
+      // segment, rather than leaving the cameras showing "Offline".
+      // Upper bound is (latest - 1) because findSegmentAt uses t < end.
+      const earliest = this._earliestStart();
       const latest = this._latestEnd();
-      if (latest && this.wallTime.getTime() > latest) {
-        this.wallTime = new Date(latest);
+      if (!earliest || !latest) return;
+      const t = this.wallTime.getTime();
+      if (t < earliest) {
+        this.wallTime = new Date(earliest);
+      } else if (t >= latest) {
+        this.wallTime = new Date(latest - 1);
       }
     },
 
