@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse, StreamingResponse
+from starlette.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from tinynvr.config import (
     Config,
@@ -100,6 +101,54 @@ async def get_config(request: Request) -> dict:
 async def get_version() -> dict:
     """Return the short git commit baked into the image at build time."""
     return {"commit": _VERSION}
+
+
+# ---------------------------------------------------------------------------
+# Debug log (opt-in diagnostic — frontend posts JSON event batches here when
+# loaded with ?debug=1, server appends them as JSON lines to a file that can
+# then be pulled back via GET). Remove this section once the gapless
+# playback investigation is done.
+# ---------------------------------------------------------------------------
+
+_DEBUG_LOG_PATH = Path("/tmp/tinynvr-debug.log")
+
+
+@app.post("/api/debug/log")
+async def debug_log_write(request: Request) -> dict:
+    """Append a batch of client-side debug events to the debug log file."""
+    body = await request.json()
+    events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list):
+        raise HTTPException(status_code=400, detail="'events' must be a list")
+    try:
+        with _DEBUG_LOG_PATH.open("a") as f:
+            for event in events:
+                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        logger.warning("debug log write failed: %s", exc)
+        raise HTTPException(status_code=500, detail="debug log unavailable") from None
+    return {"ok": True, "count": len(events)}
+
+
+@app.get("/api/debug/log")
+async def debug_log_read() -> PlainTextResponse:
+    """Return the full debug log as plain text, or an empty body if absent."""
+    try:
+        content = _DEBUG_LOG_PATH.read_text()
+    except OSError:
+        content = ""
+    return PlainTextResponse(content)
+
+
+@app.delete("/api/debug/log")
+async def debug_log_clear() -> dict:
+    """Truncate the debug log."""
+    try:
+        _DEBUG_LOG_PATH.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("debug log clear failed: %s", exc)
+        raise HTTPException(status_code=500, detail="debug log unavailable") from None
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

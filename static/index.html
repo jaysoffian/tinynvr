@@ -685,6 +685,7 @@ html, body {
           </a>
         </div>
         <video :id="'video-' + idx"
+               x-init="_debugInstrumentVideo(idx, $el)"
                preload="auto"
                muted
                playsinline>
@@ -880,6 +881,15 @@ function nvr() {
     canGoBack: true,
     hoverPct: null,    // 0-100 timeline position during hover, null when not hovering
     hoverTime: null,   // Date at hover position
+
+    // Opt-in debug instrumentation; enabled with ?debug=1 on the URL.
+    // Captures video element events + prefetch lifecycle + load calls
+    // and POSTs them to /api/debug/log in small batches. Enable in
+    // the browser, exercise the bug, curl GET /api/debug/log to pull
+    // the file back. No cost when disabled.
+    _debugEnabled: typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug'),
+    _debugBuffer: [],
+    _debugFlushTimer: null,
     selectionStart: null,  // Date object
     selectionEnd: null,    // Date object
     downloadingCam: null,   // camera name currently downloading, or null
@@ -975,6 +985,17 @@ function nvr() {
     },
 
     async init() {
+      if (this._debugEnabled) {
+        window.addEventListener('pagehide', () => {
+          if (this._debugBuffer.length === 0) return;
+          const body = new Blob(
+            [JSON.stringify({ events: this._debugBuffer })],
+            { type: 'application/json' },
+          );
+          navigator.sendBeacon('/api/debug/log', body);
+          this._debugBuffer = [];
+        });
+      }
       try {
         const [rangeRes, versionRes] = await Promise.all([
           fetch('/api/recordings/range'),
@@ -1200,6 +1221,61 @@ function nvr() {
       return `/api/segments/${encodeURIComponent(camName)}/${seg.filename}`;
     },
 
+    _debug(event) {
+      if (!this._debugEnabled) return;
+      this._debugBuffer.push({
+        wallMs: Date.now(),
+        perfMs: Math.round(performance.now()),
+        ...event,
+      });
+      if (this._debugBuffer.length >= 50) {
+        this._debugFlush();
+      } else if (!this._debugFlushTimer) {
+        this._debugFlushTimer = setTimeout(() => this._debugFlush(), 2000);
+      }
+    },
+
+    async _debugFlush() {
+      if (this._debugFlushTimer) {
+        clearTimeout(this._debugFlushTimer);
+        this._debugFlushTimer = null;
+      }
+      if (!this._debugEnabled || this._debugBuffer.length === 0) return;
+      const events = this._debugBuffer;
+      this._debugBuffer = [];
+      try {
+        await fetch('/api/debug/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ events }),
+          keepalive: true,
+        });
+      } catch (e) {}
+    },
+
+    _debugInstrumentVideo(idx, video) {
+      if (!this._debugEnabled) return;
+      const events = [
+        'emptied', 'loadstart', 'loadedmetadata', 'loadeddata',
+        'canplay', 'canplaythrough', 'playing', 'waiting', 'stalled',
+        'seeking', 'seeked', 'error', 'ended',
+      ];
+      events.forEach(name => {
+        video.addEventListener(name, () => {
+          this._debug({
+            kind: 'video',
+            ev: name,
+            cam: idx,
+            rs: video.readyState,
+            ns: video.networkState,
+            ct: Number(video.currentTime.toFixed(3)),
+            src: (video.src || '').split('/').pop(),
+            err: video.error ? video.error.code : null,
+          });
+        });
+      });
+    },
+
     // Fire-and-forget prefetch of the next segment so its bytes land
     // in the HTTP cache well before video.src = nextUrl needs them.
     // The backend sets Cache-Control: public, max-age=31536000,
@@ -1216,9 +1292,21 @@ function nvr() {
       const url = this.segmentUrl(cam.name, state.nextSegment);
       if (state.prefetchedUrl === url) return;
       state.prefetchedUrl = url;
+      const file = state.nextSegment.filename;
+      this._debug({ kind: 'prefetch', ev: 'start', cam: idx, file });
+      const t0 = performance.now();
       fetch(url)
         .then(res => res.blob())
-        .catch(() => { state.prefetchedUrl = null; });
+        .then(blob => {
+          this._debug({
+            kind: 'prefetch', ev: 'done', cam: idx, file,
+            bytes: blob.size, elapsedMs: Math.round(performance.now() - t0),
+          });
+        })
+        .catch(() => {
+          this._debug({ kind: 'prefetch', ev: 'fail', cam: idx, file });
+          state.prefetchedUrl = null;
+        });
     },
 
     downloadUrl(idx) {
@@ -1268,6 +1356,10 @@ function nvr() {
       const seg = found.segment;
       const next = this.findNextSegment(cam.name, seg);
       const url = this.segmentUrl(cam.name, seg);
+      this._debug({
+        kind: 'load', ev: 'call', cam: idx, file: seg.filename,
+        was: state?.loadedSrc ? state.loadedSrc.split('/').pop() : null,
+      });
 
       // Only reload video source if the segment actually changed
       if (state && state.loadedSrc === url) {
