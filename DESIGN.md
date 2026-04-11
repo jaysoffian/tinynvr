@@ -10,9 +10,10 @@ a local NAS, not for multi-tenant or cloud deployment.
 - Recording to local storage, never transcoding video.
 - Web UI for synced multi-camera playback with scrubbing, ~N-day
   retention, and a download-range button.
-- Target browser: Safari on macOS. Chrome and Firefox should also
-  work, but Safari is the one we design around because it's the
-  pickiest about video.
+- Target browser: Safari on macOS. It's the user's daily browser
+  and the one that has to feel right. Chrome and Firefox aren't
+  tested and aren't targeted — anything that works on Safari and
+  also happens to work on them is bonus, not requirement.
 
 ## Storage layout
 
@@ -314,7 +315,7 @@ macOS against the on-LAN NAS:
 The 254ms `loadstart → loadedmetadata` window is the entire flash.
 Decoder re-init is rounding error.
 
-### The `!found`-skip-when-playing fix (kept, commit 619dc99250)
+### The `!found`-skip-when-playing fix
 
 Before the investigation started, the flash looked worse than it
 should have because `loadSegmentForCamera`'s `!found` branch
@@ -338,15 +339,87 @@ day (real offline) vs. a transient gap (still loading).
 This is orthogonal to the prefetch story and should stay even if
 any future prefetch experiment is tried or reverted.
 
-### Failed approach #1: HLS / fragmented MP4
+### Failed approach #1: HLS
 
-Tried first, before my time on the project, on a branch called
-`hls`. Required switching the recorder to produce
-fragmented MP4 with `+empty_moov+frag_keyframe+default_base_moof`
-and serving an HLS playlist. Broke native byte-range scrubbing
-because Safari's `<video>` seeker needs a self-contained `moov`
-at the front of each file to index byte offsets. Reverted. See
-"Why not HLS?" above for the full rationale.
+Tried on a deleted branch called `hls`. Two different HLS
+designs were attempted in sequence; the first actually worked
+for the gapless-playback problem and was abandoned for reasons
+unrelated to that goal, and the second exploded under
+complexity.
+
+**First design ("Record to MPEG-TS and
+serve playback via HLS")**. Switched the recorder from
+Matroska to **MPEG-TS** (`-segment_format mpegts`), kept
+per-camera flat layout, kept minute-ish segments. Backend
+emitted an HLS `.m3u8` playlist on demand from a FastAPI
+endpoint that walked the daily `.idx` files for the requested
+range and synthesized the playlist with `EXT-X-PROGRAM-DATE-
+TIME` per segment and `EXT-X-DISCONTINUITY` between
+non-contiguous ones. Segments themselves were served as raw
+`.ts` via `FileResponse`. Frontend used **hls.js** to consume
+the playlist — segment transitions became hls.js appending
+into its internal SourceBuffer, so there was no `video.src`
+change at boundaries and **the flash was gone**. The commit
+message literally says "eliminating the stall at segment
+boundaries." Refinements followed: first shrunk
+segments to 10s in per-day subdirs so playback start was
+faster on high-bitrate cameras, second tagged in-flight
+playlists with `EXT-X-PLAYLIST-TYPE:EVENT` so hls.js stopped
+pinning playback to the live edge and allowed backward seeks.
+So far, so good.
+
+**Second design**. The
+user decided to drop hls.js and rely on **Safari's native HLS
+engine** instead (`<video src="playlist.m3u8">`). That path
+requires **fragmented MP4 HLS** (`-hls_segment_type fmp4`)
+because Safari's native HLS implementation handles fMP4
+cleanly and MPEG-TS less cleanly, *and* it required a whole
+supporting cast of init-file machinery that fMP4 HLS
+implies:
+
+- Each ffmpeg run writes one `init.mp4` (the fragment init
+  segment with the decoder config) plus N `.m4s` media
+  fragments. The media fragments reference the init by
+  filename via `EXT-X-MAP` in the playlist.
+- When the recorder restarts, the NEW ffmpeg run produces a
+  NEW init (possibly with different track IDs/timescales),
+  so historical segments must be pinned to their original
+  init file forever. The plan introduced a "run-to-init
+  association rule" where each segment's owning init is the
+  newest historical init whose timestamp is ≤ the segment's
+  timestamp.
+- Retention can't delete a historical `init.mp4` until every
+  segment associated with it has been retention-deleted
+  first, otherwise you'd orphan still-live segments. So the
+  retention logic grew to track runs, and `list_runs_all`
+  had to include empty runs.
+- Startup reconciliation after an unclean SIGKILL had to
+  probe the prior run's tail, un-link any truncated segment,
+  and be bounded by a hard 3-segment cap so a broken probe
+  pipeline couldn't mass-delete healthy files.
+- `ffmpeg -strftime 1` didn't expand in the init filename
+  parameter (only in the segment filename), so the recorder
+  had to rename the existing `init.mp4` to
+  `init-<prior_mtime>.mp4` in Python at every start before
+  spawning ffmpeg.
+
+The plan.md for this second design ran to 1006 lines. A
+"more flailing" commit and then the "hls plan.md" commit
+are where it was abandoned. The abandonment was about
+complexity, not a specific playback regression that could be
+shown in a debug log — the init-rotation / run-association /
+reconciliation tangle was too much supporting machinery for
+a personal-scale NVR.
+
+**The honest postmortem**: MPEG-TS + hls.js was a working
+gapless solution that we walked away from in pursuit of a
+"no hls.js, Safari-native only" variant that turned out to be
+architecturally much more complex. If the goal is zero-flash
+playback and the user is willing to accept hls.js as a
+dependency and MPEG-TS on disk, design #1 is a known-working
+path. The "Why not HLS?" section above frames HLS as a
+categorical dead end, which is not quite right — design #1
+worked for this problem, design #2 was what didn't work.
 
 ### Failed approach #2: Double-buffered `<video>` swap (1a2619f2da → 77518f7b82)
 
@@ -400,7 +473,7 @@ dominates.
 **Outcome.** Reverted. Single `<video>` per camera. The flash came
 back but the doorbell stayed un-cropped.
 
-### Failed approach #3: HTTP cache prefetch via `fetch().blob()` (f14e2b177d → da2c41a1f6)
+### Failed approach #3: HTTP cache prefetch via `fetch().blob()`
 
 **Theory.** Suggested by a second-opinion research agent as a
 fallback to double-buffering. The single `<video>` element stays,
@@ -445,7 +518,7 @@ earlier.
 ~double the network cost for zero playback benefit. Removed in
 the same revert as approach #4.
 
-### Failed approach #4: Blob-URL prefetch (cf6d1b8c14 → da2c41a1f6)
+### Failed approach #4: Blob-URL prefetch
 
 **Theory.** If Safari's HTTP cache isn't shared with `<video>`,
 bypass the cache entirely. Keep the `fetch()` prefetch, but
@@ -505,7 +578,7 @@ test (null check) and started a second fetch. Small memory leak
 per duplicate blob, doubled prefetch bandwidth. Latent bug, but
 not the primary cause of the flash.
 
-**Outcome.** Reverted. `da2c41a1f6` restores plain
+**Outcome.** Reverted. Restored plain
 `video.src = httpUrl` with no prefetch.
 
 ### Still on the table, not yet tried
@@ -565,7 +638,7 @@ Safari's `<video>` element actually consults (unlike `fetch()`
 blobs). Cheap to try, low confidence of working — Safari's
 handling of preload hints is historically inconsistent.
 
-### Diagnostic infrastructure (kept, commit 7d6ce90f6f)
+### Diagnostic infrastructure
 
 `/api/debug/log` endpoints + `?debug=1` frontend instrumentation
 still live in the code for the next person to dig into this.
