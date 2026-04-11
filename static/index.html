@@ -1074,7 +1074,15 @@ function nvr() {
         const res = await fetch('/api/cameras');
         this.cameras = await res.json();
         this.cameras.forEach((_, idx) => {
-          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, prefetchedUrl: null, videoLoading: false };
+          this.camStates[idx] = {
+            currentSegment: null,
+            nextSegment: null,
+            loadedSrc: null,
+            prefetchedFilename: null,  // filename of the blob we have ready
+            prefetchedBlobUrl: null,   // URL.createObjectURL(blob) for that file
+            playingBlobUrl: null,      // blob URL currently in video.src (for later revoke)
+            videoLoading: false,
+          };
         });
       } catch (e) {
         console.error('Failed to fetch cameras:', e);
@@ -1285,27 +1293,51 @@ function nvr() {
     // is required — Safari won't cache a response that's abandoned
     // mid-stream. Dedup via state.prefetchedUrl so we don't re-fetch
     // the same next-segment on every clock tick.
+    _revokeBlobUrls(state) {
+      if (state.playingBlobUrl) {
+        URL.revokeObjectURL(state.playingBlobUrl);
+        state.playingBlobUrl = null;
+      }
+      if (state.prefetchedBlobUrl) {
+        URL.revokeObjectURL(state.prefetchedBlobUrl);
+        state.prefetchedBlobUrl = null;
+      }
+      state.prefetchedFilename = null;
+    },
+
     _prefetchNextSegment(idx) {
       const state = this.camStates[idx];
       const cam = this.cameras[idx];
       if (!state || !cam || !state.nextSegment) return;
-      const url = this.segmentUrl(cam.name, state.nextSegment);
-      if (state.prefetchedUrl === url) return;
-      state.prefetchedUrl = url;
-      const file = state.nextSegment.filename;
-      this._debug({ kind: 'prefetch', ev: 'start', cam: idx, file });
+      const filename = state.nextSegment.filename;
+      // Already prefetched this exact segment, nothing to do.
+      if (state.prefetchedFilename === filename && state.prefetchedBlobUrl) return;
+
+      // Abandon any stale prefetch for a different segment
+      if (state.prefetchedBlobUrl) {
+        URL.revokeObjectURL(state.prefetchedBlobUrl);
+        state.prefetchedBlobUrl = null;
+      }
+      state.prefetchedFilename = filename;
+      this._debug({ kind: 'prefetch', ev: 'start', cam: idx, file: filename });
       const t0 = performance.now();
-      fetch(url)
+      fetch(this.segmentUrl(cam.name, state.nextSegment))
         .then(res => res.blob())
         .then(blob => {
+          // We may have moved on to a different next-segment since the
+          // fetch started — discard if so, don't stomp on a newer prefetch.
+          if (state.prefetchedFilename !== filename) return;
+          state.prefetchedBlobUrl = URL.createObjectURL(blob);
           this._debug({
-            kind: 'prefetch', ev: 'done', cam: idx, file,
+            kind: 'prefetch', ev: 'done', cam: idx, file: filename,
             bytes: blob.size, elapsedMs: Math.round(performance.now() - t0),
           });
         })
         .catch(() => {
-          this._debug({ kind: 'prefetch', ev: 'fail', cam: idx, file });
-          state.prefetchedUrl = null;
+          this._debug({ kind: 'prefetch', ev: 'fail', cam: idx, file: filename });
+          if (state.prefetchedFilename === filename) {
+            state.prefetchedFilename = null;
+          }
         });
     },
 
@@ -1346,6 +1378,7 @@ function nvr() {
           state.nextSegment = null;
           state.loadedSrc = null;
           state.videoLoading = false;
+          this._revokeBlobUrls(state);
         }
         video.onloadedmetadata = null;
         video.removeAttribute('src');
@@ -1381,7 +1414,31 @@ function nvr() {
         state.videoLoading = true;
       }
 
-      video.src = url;
+      // If we previously played a blob URL, revoke it now before we
+      // overwrite video.src. The <video> element is about to drop its
+      // old source anyway (emptied/loadstart fire on src change), so
+      // the blob URL is no longer needed from the player's side.
+      if (state && state.playingBlobUrl) {
+        URL.revokeObjectURL(state.playingBlobUrl);
+        state.playingBlobUrl = null;
+      }
+
+      // Prefer the prefetched blob URL if it matches this segment —
+      // Safari's media cache is separate from its HTTP cache, so the
+      // only reliable way to avoid a fresh network fetch here is to
+      // hand the video element bytes we already hold in memory.
+      let src = url;
+      if (state && state.prefetchedFilename === seg.filename && state.prefetchedBlobUrl) {
+        src = state.prefetchedBlobUrl;
+        state.playingBlobUrl = state.prefetchedBlobUrl;
+        state.prefetchedBlobUrl = null;
+        state.prefetchedFilename = null;
+        this._debug({ kind: 'load', ev: 'use-blob', cam: idx, file: seg.filename });
+      } else {
+        this._debug({ kind: 'load', ev: 'use-http', cam: idx, file: seg.filename });
+      }
+
+      video.src = src;
 
       // Use onX (not addEventListener) so that rapid segment changes
       // replace the handler instead of accumulating stale listeners
