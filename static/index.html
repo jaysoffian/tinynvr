@@ -1053,7 +1053,7 @@ function nvr() {
         const res = await fetch('/api/cameras');
         this.cameras = await res.json();
         this.cameras.forEach((_, idx) => {
-          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, videoLoading: false };
+          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, prefetchedUrl: null, videoLoading: false };
         });
       } catch (e) {
         console.error('Failed to fetch cameras:', e);
@@ -1200,6 +1200,27 @@ function nvr() {
       return `/api/segments/${encodeURIComponent(camName)}/${seg.filename}`;
     },
 
+    // Fire-and-forget prefetch of the next segment so its bytes land
+    // in the HTTP cache well before video.src = nextUrl needs them.
+    // The backend sets Cache-Control: public, max-age=31536000,
+    // immutable on segment responses, so the cached body is reused
+    // indefinitely and the subsequent <video> request reads from
+    // disk instead of the network. Draining the response via .blob()
+    // is required — Safari won't cache a response that's abandoned
+    // mid-stream. Dedup via state.prefetchedUrl so we don't re-fetch
+    // the same next-segment on every clock tick.
+    _prefetchNextSegment(idx) {
+      const state = this.camStates[idx];
+      const cam = this.cameras[idx];
+      if (!state || !cam || !state.nextSegment) return;
+      const url = this.segmentUrl(cam.name, state.nextSegment);
+      if (state.prefetchedUrl === url) return;
+      state.prefetchedUrl = url;
+      fetch(url)
+        .then(res => res.blob())
+        .catch(() => { state.prefetchedUrl = null; });
+    },
+
     downloadUrl(idx) {
       const cam = this.cameras[idx];
       const state = this.camStates[idx];
@@ -1257,6 +1278,7 @@ function nvr() {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
         }
+        this._prefetchNextSegment(idx);
         return;
       }
 
@@ -1280,6 +1302,7 @@ function nvr() {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
         }
+        this._prefetchNextSegment(idx);
       };
 
       video.onerror = () => {
