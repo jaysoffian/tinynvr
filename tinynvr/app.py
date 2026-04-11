@@ -289,6 +289,10 @@ async def download_range(
         p = camera_dir / filename
         if not p.resolve().is_relative_to(storage):
             continue
+        if not p.is_file():
+            # Under rolling retention, an .idx can briefly reference a
+            # .mp4 that's already been deleted. Skip silently.
+            continue
         try:
             ts = datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S").replace(
                 tzinfo=UTC
