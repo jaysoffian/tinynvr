@@ -2,11 +2,15 @@
 
 A lightweight, self-hosted NVR that records RTSP camera streams and provides a web UI for synced multi-camera playback with timeline scrubbing.
 
-- Records via ffmpeg with no transcoding video (`-c:v copy`), near-zero CPU
-- 1-minute segment files, crash-safe
-- 2×2 synced multi-camera viewer with 24-hour timeline
+- Records via ffmpeg with no video transcoding (`-c:v copy`), near-zero CPU
+- 1-minute self-contained MP4 segments with `moov` at front for instant byte-range scrubbing
+- Gapless playback across segment boundaries (double-buffered `<video>`, tested against Safari's preload hedging)
+- Synced multi-camera grid with a 24-hour timeline that handles DST transitions
+- Rolling retention (configurable, default 7 days)
 - HomeAssistant webhook to toggle cameras on/off
-- 7-day rolling retention
+
+See [DESIGN.md](DESIGN.md) for the full design, including the storage
+layout, recording/playback pipelines, and the reasoning against HLS.
 
 ## Requirements
 
@@ -88,13 +92,26 @@ curl -X POST http://tinynvr:8554/api/webhook/living-room \
 ## Docker
 
 ```bash
-docker build -t tinynvr .
-docker run -d \
+# Build (alpine:edge + uv-installed Python 3.14 + ffmpeg from edge)
+make image
+
+# Run
+podman run -d \
   -p 8554:8554 \
   -v /path/to/recordings:/recordings \
-  -v /path/to/config.yaml:/app/config.yaml \
-  tinynvr
+  -v /path/to/config-dir:/config \
+  tinynvr:latest
 ```
+
+`make image` stamps the short git SHA into `/app/VERSION` and the
+standard OCI image labels (`org.opencontainers.image.revision`,
+`.source`, `.title`). The running app reads `/app/VERSION` at startup
+and exposes it via `GET /api/version`; the web UI shows it as small
+dimmed text at the right edge of the topbar.
+
+The `/config` volume expects a directory containing `config.yaml`
+(the container reads `TINYNVR_CONFIG=/config/config.yaml`). The
+`/recordings` volume is the persistent segment store.
 
 ## Development
 

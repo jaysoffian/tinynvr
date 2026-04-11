@@ -21,3 +21,17 @@ a "Why not HLS?" rationale.
 ## Git
 
 - Do NOT include Claude attribution in commit messages.
+
+## Design constraints (do not re-litigate)
+
+- Segments on disk are **non-fragmented MP4 with `moov` at front**
+  (ffmpeg `-segment_format mp4 -segment_format_options
+  movflags=+faststart`). This is load-bearing for byte-range
+  scrubbing. Do not switch to fragmented MP4, HLS, or MSE — see
+  [DESIGN.md](DESIGN.md) "Why not HLS?" for the full rationale and
+  the specific regressions that killed the HLS branch.
+- `SEGMENT_SECONDS` is fixed at 60 and intentionally not
+  configurable — see README.md "Why 1-minute segments".
+- Gapless playback is achieved via double-buffered `<video>` swap
+  in `static/index.html`, not via any streaming protocol. See
+  DESIGN.md "Playback pipeline".
