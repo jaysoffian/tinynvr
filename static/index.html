@@ -167,18 +167,11 @@ html, body {
   z-index: 100;
   border-radius: 0;
 }
-.video-panel .vid {
-  position: absolute;
-  inset: 0;
+.video-panel video {
   width: 100%;
   height: 100%;
   object-fit: contain;
   display: block;
-  opacity: 0;
-  pointer-events: none;
-}
-.video-panel .vid.active {
-  opacity: 1;
 }
 .video-panel .panel-header {
   position: absolute;
@@ -677,16 +670,7 @@ html, body {
             </svg>
           </a>
         </div>
-        <video :id="'video-' + idx + '-a'"
-               class="vid"
-               :class="{ active: (camStates[idx]?.activeSlot ?? 'a') === 'a' }"
-               preload="auto"
-               muted
-               playsinline>
-        </video>
-        <video :id="'video-' + idx + '-b'"
-               class="vid"
-               :class="{ active: camStates[idx]?.activeSlot === 'b' }"
+        <video :id="'video-' + idx"
                preload="auto"
                muted
                playsinline>
@@ -858,7 +842,7 @@ function nvr() {
     loading: true,
     cameras: [],
     segments: {},       // { cameraName: [segment, ...] }
-    camStates: {},      // { idx: { activeSlot, filenameA, filenameB, currentSegment, nextSegment, videoLoading } }
+    camStates: {},      // { idx: { currentSegment, nextSegment, loadedSrc } }
     selectedDate: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
     wallTime: null,     // Date object: the playback position in absolute time
     playing: false,
@@ -1046,14 +1030,7 @@ function nvr() {
         const res = await fetch('/api/cameras');
         this.cameras = await res.json();
         this.cameras.forEach((_, idx) => {
-          this.camStates[idx] = {
-            activeSlot: 'a',
-            filenameA: null,
-            filenameB: null,
-            currentSegment: null,
-            nextSegment: null,
-            videoLoading: false,
-          };
+          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, videoLoading: false };
         });
       } catch (e) {
         console.error('Failed to fetch cameras:', e);
@@ -1207,82 +1184,8 @@ function nvr() {
       return this.segmentUrl(cam.name, state.currentSegment) + '?download=1';
     },
 
-    _otherSlot(slot) {
-      return slot === 'a' ? 'b' : 'a';
-    },
-
-    getVideo(idx, slot) {
-      const s = slot ?? this.camStates[idx]?.activeSlot ?? 'a';
-      return document.getElementById('video-' + idx + '-' + s);
-    },
-
-    _slotKey(slot) {
-      return slot === 'a' ? 'filenameA' : 'filenameB';
-    },
-
-    _clearSlot(idx, slot) {
-      const state = this.camStates[idx];
-      if (!state) return;
-      state[this._slotKey(slot)] = null;
-      const video = this.getVideo(idx, slot);
-      if (!video) return;
-      video.onloadedmetadata = null;
-      video.onerror = null;
-      video.onended = null;
-      video.removeAttribute('src');
-      video.load();
-    },
-
-    // Prime the non-active slot with the segment after currentSegment
-    // so the next transition is a no-network opacity swap. Safari
-    // treats preload="auto" on a hidden <video> as a hint and often
-    // only fetches metadata, so we explicitly force a first-frame
-    // decode via #t=0.001 on the URL plus a programmatic seek on
-    // loadedmetadata — belt and suspenders for WebKit's preload
-    // hedging.
-    _preloadPending(idx) {
-      const state = this.camStates[idx];
-      const cam = this.cameras[idx];
-      if (!state || !cam) return;
-      const next = state.nextSegment;
-      const otherSlot = this._otherSlot(state.activeSlot);
-      if (!next) {
-        this._clearSlot(idx, otherSlot);
-        return;
-      }
-      const key = this._slotKey(otherSlot);
-      if (state[key] === next.filename) return;
-      const video = this.getVideo(idx, otherSlot);
-      if (!video) return;
-      state[key] = next.filename;
-      video.onloadedmetadata = null;
-      video.onerror = null;
-      video.onended = null;
-      video.muted = true;
-      video.src = this.segmentUrl(cam.name, next) + '#t=0.001';
-      video.load();
-      video.onloadedmetadata = () => {
-        video.onloadedmetadata = null;
-        try { video.currentTime = 0.001; } catch (e) {}
-        // Safari often ignores preload="auto" + seek on a hidden
-        // element and only fetches metadata. Kick playback briefly
-        // muted to force a first-GOP fetch + decode, then pause.
-        video.play().then(() => video.pause()).catch(() => {});
-      };
-      video.onerror = () => {
-        video.onerror = null;
-        state[key] = null;
-      };
-    },
-
-    _attachActiveHandlers(idx, video) {
-      video.onerror = () => {
-        video.onerror = null;
-        const state = this.camStates[idx];
-        if (state) state.videoLoading = false;
-        this._onSegmentEnd(idx);
-      };
-      video.onended = () => this._onSegmentEnd(idx);
+    getVideo(idx) {
+      return document.getElementById('video-' + idx);
     },
 
     loadSegmentsForAll() {
@@ -1291,98 +1194,79 @@ function nvr() {
 
     loadSegmentForCamera(idx) {
       const cam = this.cameras[idx];
-      const state = this.camStates[idx];
-      if (!cam || !state) return;
-
-      const activeSlot = state.activeSlot;
-      const activeVideo = this.getVideo(idx, activeSlot);
-      if (!activeVideo) return;
+      const video = this.getVideo(idx);
+      if (!video || !cam) return;
 
       const found = this.findSegmentAt(cam.name, this.wallTime);
+      const state = this.camStates[idx];
+
       if (!found) {
         // During live playback, wallTime can briefly land in a gap
-        // between segments (a missing/failed segment, or a sub-second
-        // ffmpeg rotation boundary). Leave the active slot's last
-        // frame visible and the stale currentSegment in place; the
-        // free-running clock will advance wallTime and the next tick
-        // will re-enter loadSegmentForCamera with a valid segment.
-        // Only clear when we're not playing — an explicit scrub into
-        // an empty region or a day switch should actually blank out.
+        // between segments (a missing/failed segment, or sub-second
+        // ffmpeg rotation drift). Leave the current frame and stale
+        // state in place; the free-running clock will advance out of
+        // the gap and the next tick will find a real segment. Only
+        // clear when not playing — an explicit scrub into an empty
+        // region, or a day switch, should actually blank out.
         if (this.playing) return;
-        state.currentSegment = null;
-        state.nextSegment = null;
-        state.videoLoading = false;
-        this._clearSlot(idx, activeSlot);
+        if (state) {
+          state.currentSegment = null;
+          state.nextSegment = null;
+          state.loadedSrc = null;
+          state.videoLoading = false;
+        }
+        video.onloadedmetadata = null;
+        video.removeAttribute('src');
+        video.load();
         return;
       }
 
       const seg = found.segment;
-      const nextSeg = this.findNextSegment(cam.name, seg);
-      const activeKey = this._slotKey(activeSlot);
-      const otherSlot = this._otherSlot(activeSlot);
-      const otherKey = this._slotKey(otherSlot);
+      const next = this.findNextSegment(cam.name, seg);
+      const url = this.segmentUrl(cam.name, seg);
 
-      // Case 1: active slot already has this segment — just reseek.
-      if (state[activeKey] === seg.filename) {
+      // Only reload video source if the segment actually changed
+      if (state && state.loadedSrc === url) {
         state.currentSegment = seg;
-        state.nextSegment = nextSeg;
-        state.videoLoading = false;
-        this._seekVideo(activeVideo, seg);
-        if (this.playing && activeVideo.paused) {
-          activeVideo.playbackRate = this.playbackSpeed;
-          activeVideo.play().catch(() => {});
+        state.nextSegment = next;
+        this._seekVideo(video, seg);
+        if (this.playing && video.paused) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
         }
-        this._preloadPending(idx);
         return;
       }
 
-      // Case 2: pending slot has this segment preloaded — flip slots.
-      // This is the hot path for normal playback across a segment
-      // boundary: no network fetch, no loadedmetadata wait, no flash.
-      if (state[otherKey] === seg.filename) {
-        const otherVideo = this.getVideo(idx, otherSlot);
-        if (otherVideo) {
-          if (!activeVideo.paused) activeVideo.pause();
-          activeVideo.onended = null;
-          state.activeSlot = otherSlot;
-          state.currentSegment = seg;
-          state.nextSegment = nextSeg;
-          state.videoLoading = false;
-          otherVideo.muted = this.unmutedIdx !== idx;
-          this._attachActiveHandlers(idx, otherVideo);
-          this._seekVideo(otherVideo, seg);
-          if (this.playing) {
-            otherVideo.playbackRate = this.playbackSpeed;
-            otherVideo.play().catch(() => {});
-          }
-          this._preloadPending(idx);
-          return;
-        }
+      if (state) {
+        state.currentSegment = seg;
+        state.nextSegment = next;
+        state.loadedSrc = url;
+        state.videoLoading = true;
       }
 
-      // Case 3: neither slot has it — fresh load into the active slot.
-      state.currentSegment = seg;
-      state.nextSegment = nextSeg;
-      state[activeKey] = seg.filename;
-      state.videoLoading = true;
+      video.src = url;
 
-      activeVideo.onloadedmetadata = null;
-      activeVideo.onerror = null;
-      activeVideo.onended = null;
-      activeVideo.src = this.segmentUrl(cam.name, seg);
-
-      activeVideo.onloadedmetadata = () => {
-        activeVideo.onloadedmetadata = null;
-        state.videoLoading = false;
-        activeVideo.muted = this.unmutedIdx !== idx;
-        this._seekVideo(activeVideo, seg);
+      // Use onX (not addEventListener) so that rapid segment changes
+      // replace the handler instead of accumulating stale listeners
+      video.onloadedmetadata = () => {
+        video.onloadedmetadata = null;
+        if (state) state.videoLoading = false;
+        video.muted = this.unmutedIdx !== idx;
+        this._seekVideo(video, seg);
         if (this.playing) {
-          activeVideo.playbackRate = this.playbackSpeed;
-          activeVideo.play().catch(() => {});
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
         }
-        this._preloadPending(idx);
       };
-      this._attachActiveHandlers(idx, activeVideo);
+
+      video.onerror = () => {
+        video.onerror = null;
+        if (state) state.videoLoading = false;
+        // Segment failed to load (corrupt file, 500, etc.) — skip it
+        this._onSegmentEnd(idx);
+      };
+
+      video.onended = () => this._onSegmentEnd(idx);
     },
 
     _seekVideo(video, seg) {
