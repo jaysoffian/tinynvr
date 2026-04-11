@@ -694,7 +694,7 @@ html, body {
         <div class="no-recording-overlay"
              x-show="!camStates[idx]?.currentSegment || camStates[idx]?.videoLoading"
              x-cloak>
-          <span x-text="loading || camStates[idx]?.videoLoading ? 'Loading\u2026' : 'Offline'"></span>
+          <span x-text="(loading || camStates[idx]?.videoLoading || (segments[cam.name]?.length > 0)) ? 'Loading\u2026' : 'Offline'"></span>
         </div>
         <!-- Fullscreen overlay with controls + timeline -->
         <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
@@ -1300,12 +1300,19 @@ function nvr() {
 
       const found = this.findSegmentAt(cam.name, this.wallTime);
       if (!found) {
+        // During live playback, wallTime can briefly land in a gap
+        // between segments (a missing/failed segment, or a sub-second
+        // ffmpeg rotation boundary). Leave the active slot's last
+        // frame visible and the stale currentSegment in place; the
+        // free-running clock will advance wallTime and the next tick
+        // will re-enter loadSegmentForCamera with a valid segment.
+        // Only clear when we're not playing — an explicit scrub into
+        // an empty region or a day switch should actually blank out.
+        if (this.playing) return;
         state.currentSegment = null;
         state.nextSegment = null;
         state.videoLoading = false;
         this._clearSlot(idx, activeSlot);
-        // Leave pending as-is; it might still be valid for a scrub
-        // to a different wall time.
         return;
       }
 
