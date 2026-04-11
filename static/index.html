@@ -1126,15 +1126,20 @@ function nvr() {
       // Keep wallTime inside the playable range so scrubbing past either
       // end lands on a position where findSegmentAt actually returns a
       // segment, rather than leaving the cameras showing "Offline".
-      // Upper bound is (latest - 1) because findSegmentAt uses t < end.
+      //
+      // The upper clamp sits a full segment back from the newest closed
+      // segment across cameras, because ffmpeg's segment rotation isn't
+      // globally synchronized — one camera routinely sits up to a minute
+      // ahead of the others, and pinning to its edge would leave the
+      // other three cameras past their own latest-end.
       const earliest = this._earliestStart();
       const latest = this._latestEnd();
       if (!earliest || !latest) return;
       const t = this.wallTime.getTime();
       if (t < earliest) {
         this.wallTime = new Date(earliest);
-      } else if (t >= latest) {
-        this.wallTime = new Date(latest - 1);
+      } else if (t >= latest - this._segmentDurationMs) {
+        this.wallTime = new Date(Math.max(earliest, latest - this._segmentDurationMs));
       }
     },
 
