@@ -777,12 +777,12 @@ html, body {
       </div>
       <!-- Hour labels -->
       <div class="timeline-hours">
-        <template x-for="h in 24" :key="h">
+        <template x-for="(tick, i) in hourTicks" :key="i">
           <span>
-            <span class="timeline-hour-tick" :style="'left:' + ((h-1)/24*100) + '%'"></span>
+            <span class="timeline-hour-tick" :style="'left:' + tick.leftPct + '%'"></span>
             <span class="timeline-hour-mark"
-                  :style="'left:' + ((h-1)/24*100) + '%'"
-                  x-text="String(h-1).padStart(2,'0')"></span>
+                  :style="'left:' + tick.leftPct + '%'"
+                  x-text="tick.label"></span>
           </span>
         </template>
       </div>
@@ -830,8 +830,6 @@ html, body {
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
 <script>
 function nvr() {
-  const SECONDS_PER_DAY = 86400;
-
   return {
     loading: true,
     cameras: [],
@@ -869,13 +867,45 @@ function nvr() {
 
     get cursorPercent() {
       if (!this.wallTime) return 0;
-      const sod = this._startOfDay();
-      const diff = (this.wallTime - sod) / 1000;
-      return Math.max(0, Math.min(100, diff / SECONDS_PER_DAY * 100));
+      const sod = this._startOfDay().getTime();
+      return Math.max(0, Math.min(100, (this.wallTime.getTime() - sod) / this._dayLengthMs() * 100));
     },
 
     _startOfDay() {
       return new Date(this.selectedDate + 'T00:00:00');
+    },
+
+    // Local midnight of the day after selectedDate. Uses the Date
+    // constructor (not ISO parsing) so DST offsets resolve from the
+    // browser's tz database — spring-ahead days are 23h, fall-back 25h.
+    _nextStartOfDay() {
+      const [y, m, d] = this.selectedDate.split('-').map(Number);
+      return new Date(y, m - 1, d + 1);
+    },
+
+    _dayLengthMs() {
+      return this._nextStartOfDay().getTime() - this._startOfDay().getTime();
+    },
+
+    // One tick per real-time hour from local midnight to next local
+    // midnight, labeled with the local clock hour at that instant.
+    // Normal days produce 24 ticks 00..23; spring-ahead produces 23
+    // ticks with one local hour absent; fall-back produces 25 ticks
+    // with one local hour repeated. No DST rules hardcoded — the
+    // labels come from Date.getHours() which resolves via the IANA
+    // tz database.
+    get hourTicks() {
+      const sod = this._startOfDay().getTime();
+      const dayLen = this._dayLengthMs();
+      const ticks = [];
+      for (let ms = 0; ms < dayLen; ms += 3600000) {
+        const d = new Date(sod + ms);
+        ticks.push({
+          label: String(d.getHours()).padStart(2, '0'),
+          leftPct: (ms / dayLen) * 100,
+        });
+      }
+      return ticks;
     },
 
     buildWeek() {
@@ -994,7 +1024,7 @@ function nvr() {
     _utcDatesForLocalDate() {
       // A local date spans up to 2 UTC dates (e.g. EDT midnight = 04:00 UTC)
       const localStart = this._startOfDay();
-      const localEnd = new Date(localStart.getTime() + SECONDS_PER_DAY * 1000 - 1);
+      const localEnd = new Date(localStart.getTime() + this._dayLengthMs() - 1);
       const dates = new Set([
         localStart.toISOString().slice(0, 10),
         localEnd.toISOString().slice(0, 10),
@@ -1005,7 +1035,7 @@ function nvr() {
     async fetchAllSegments() {
       const utcDates = this._utcDatesForLocalDate();
       const dayStart = this._startOfDay().getTime();
-      const dayEnd = dayStart + SECONDS_PER_DAY * 1000;
+      const dayEnd = dayStart + this._dayLengthMs();
 
       const results = await Promise.allSettled(
         this.cameras.map(async cam => {
@@ -1399,17 +1429,16 @@ function nvr() {
     segmentBlockStyle(seg) {
       const start = this._parseStart(seg);
       const sod = this._startOfDay();
-      const startSec = (start - sod) / 1000;
-      const left = startSec / SECONDS_PER_DAY * 100;
-      let durSec;
+      const dayLen = this._dayLengthMs();
+      const left = (start - sod) / dayLen * 100;
+      let durMs;
       if (seg.duration_sec > 0) {
-        durSec = seg.duration_sec;
+        durMs = seg.duration_sec * 1000;
       } else {
         // Active recording: extend to now, capped at segment duration
-        const elapsed = (Date.now() - start.getTime()) / 1000;
-        durSec = Math.min(elapsed, this._segmentDurationMs / 1000);
+        durMs = Math.min(Date.now() - start.getTime(), this._segmentDurationMs);
       }
-      const width = durSec / SECONDS_PER_DAY * 100;
+      const width = durMs / dayLen * 100;
       return `left:${left}%;width:${width}%`;
     },
 
@@ -1439,8 +1468,7 @@ function nvr() {
       const rect = overlay.getBoundingClientRect();
       const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
       const pct = x / rect.width;
-      const seconds = pct * SECONDS_PER_DAY;
-      this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
+      this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
       this._clampWallTime();
       this.loadSegmentsForAll();
     },
@@ -1456,8 +1484,7 @@ function nvr() {
       const rect = this._fsScrubEl.getBoundingClientRect();
       const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
       const pct = x / rect.width;
-      const seconds = pct * SECONDS_PER_DAY;
-      return new Date(this._startOfDay().getTime() + seconds * 1000);
+      return new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
     },
 
     startFsScrubOrSelect(e) {
@@ -1504,8 +1531,7 @@ function nvr() {
       const rect = this._fsScrubEl.getBoundingClientRect();
       const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
       const pct = x / rect.width;
-      const seconds = pct * SECONDS_PER_DAY;
-      this.wallTime = new Date(this._startOfDay().getTime() + seconds * 1000);
+      this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
       this._clampWallTime();
       this.loadSegmentsForAll();
     },
@@ -1518,8 +1544,7 @@ function nvr() {
       const rect = overlay.getBoundingClientRect();
       const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
       const pct = x / rect.width;
-      const seconds = pct * SECONDS_PER_DAY;
-      return new Date(this._startOfDay().getTime() + seconds * 1000);
+      return new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
     },
 
     startScrubOrSelect(e) {
@@ -1550,8 +1575,9 @@ function nvr() {
     selectionStyle() {
       if (!this.selectionStart || !this.selectionEnd) return 'display:none';
       const sod = this._startOfDay();
-      const startPct = (this.selectionStart - sod) / 1000 / SECONDS_PER_DAY * 100;
-      const endPct = (this.selectionEnd - sod) / 1000 / SECONDS_PER_DAY * 100;
+      const dayLen = this._dayLengthMs();
+      const startPct = (this.selectionStart - sod) / dayLen * 100;
+      const endPct = (this.selectionEnd - sod) / dayLen * 100;
       const left = Math.max(0, Math.min(100, startPct));
       const right = Math.max(0, Math.min(100, endPct));
       return `left:${left}%;width:${right - left}%`;
