@@ -8,15 +8,14 @@ WORKDIR /app
 RUN uv python install 3.14
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY tinynvr/ tinynvr/
-COPY static/ static/
-RUN uv sync --frozen --no-dev
 
 FROM alpine:edge
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
-COPY --from=builder /app /app
 COPY --from=builder /usr/local /usr/local
+COPY --from=builder /app/.venv /app/.venv
+COPY tinynvr/ tinynvr/
+COPY static/ static/
 ENV PATH="/app/.venv/bin:$PATH" TINYNVR_CONFIG=/config/config.yaml
 VOLUME ["/config", "/recordings"]
 EXPOSE 8554
