@@ -914,17 +914,10 @@ function nvr() {
 
     async init() {
       try {
-        const [rangeRes, configRes] = await Promise.all([
-          fetch('/api/recordings/range'),
-          fetch('/api/config'),
-        ]);
+        const rangeRes = await fetch('/api/recordings/range');
         const range = await rangeRes.json();
         if (range.earliest) {
           this.earliestDate = range.earliest;
-        }
-        const config = await configRes.json();
-        if (config.storage?.segment_minutes) {
-          this._segmentDurationMs = config.storage.segment_minutes * 60 * 1000;
         }
       } catch (e) {}
       this.buildWeek();
@@ -1454,7 +1447,7 @@ function nvr() {
 
     // -- Fullscreen scrubbing --
 
-    _segmentDurationMs: 300000, // fallback; updated from config API in init()
+    _segmentDurationMs: 60000, // fixed 1-minute segments, see recorder.py
     _fsScrubbing: false,
     _fsScrubEl: null,
 

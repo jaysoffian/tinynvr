@@ -16,6 +16,8 @@ from tinynvr.duration import append_duration, validate_indexes
 
 logger = logging.getLogger(__name__)
 
+SEGMENT_SECONDS = 60
+
 
 class CameraState(StrEnum):
     STOPPED = "stopped"
@@ -76,7 +78,7 @@ class CameraRecorder:
             "-reset_timestamps",
             "1",
             "-segment_time",
-            str(self.storage.segment_minutes * 60),
+            str(SEGMENT_SECONDS),
             "-segment_format",
             "mp4",
             "-segment_format_options",
