@@ -1444,11 +1444,11 @@ function nvr() {
           break;
         case 'ArrowRight':
           e.preventDefault();
-          this._seekByKey(30000);
+          this._seekByKey(e.shiftKey ? 5000 : 30000);
           break;
         case 'ArrowLeft':
           e.preventDefault();
-          this._seekByKey(-30000);
+          this._seekByKey(e.shiftKey ? -5000 : -30000);
           break;
         case 'Escape':
           this.fullscreenIdx = null;
