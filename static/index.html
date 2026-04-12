@@ -1698,6 +1698,11 @@ function nvr() {
       // Trim old buffered data lazily to keep memory bounded. Best-effort.
       // Runs from the append loop after a successful append; both SBs
       // are idle at that point.
+      //
+      // Skip cleanup when the queue still has work — sb.remove() is
+      // async and sets sb.updating, which would cause the next
+      // appendBuffer to throw InvalidStateError.
+      if (state.appendQueue.length > 0) return;
       const idx = Object.keys(this.camStates).find(k => this.camStates[k] === state);
       if (idx == null) return;
       const videoEl = this.getVideo(Number(idx));
@@ -1722,8 +1727,12 @@ function nvr() {
       const state = this.camStates[idx];
       const video = this.getVideo(idx);
       if (!state) return;
+      // Abort any in-flight fetch so the old append loop exits quickly.
+      state.fetchAbort?.abort();
       state.appendQueue = [];
-      state.appending = false;
+      // Don't force state.appending = false — let the old append loop
+      // exit via the mediaSource.readyState guard. Forcing it here
+      // could allow two concurrent loops.
       state.appendedFilenames = new Set();
       state.anchorMs = null;
       state.videoInitAppended = false;
