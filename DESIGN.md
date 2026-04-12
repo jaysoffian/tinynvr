@@ -7,7 +7,7 @@ a local NAS, not for multi-tenant or cloud deployment.
 ## Scope
 
 - 4–8 RTSP cameras, already served by a local go2rtc (or directly).
-- Recording to local storage, never transcoding video.
+- Recording to local storage, never transcoding.
 - Web UI for synced multi-camera playback with scrubbing, ~N-day
   retention, and a download-range button.
 - Target browser: Safari on macOS. It's the user's daily browser
@@ -53,8 +53,7 @@ ffmpeg -rtsp_transport tcp -use_wallclock_as_timestamps 1 -i <rtsp> \
 - **Nothing is ever transcoded** (`-c copy`). go2rtc is the upstream
   and is expected to normalize each camera to H.264 + AAC before
   TinyNVR sees it (the user does this via the `?mp4` stream variant
-  in go2rtc's stream URLs). Recording is pure stream copy — CPU cost
-  is effectively zero. If you're pointing TinyNVR at an RTSP source
+  in go2rtc's stream URLs). If you're pointing TinyNVR at an RTSP source
   that emits `pcm_mulaw` or another non-MP4 audio codec directly,
   segments will fail to mux; fix the upstream, don't add an encode
   step here.
@@ -67,10 +66,25 @@ ffmpeg -rtsp_transport tcp -use_wallclock_as_timestamps 1 -i <rtsp> \
   on clean close, so Safari can start playing immediately without
   seeking to the end of the file to find metadata.
 - **Segment length is fixed at 60 seconds** via `SEGMENT_SECONDS` in
-  `recorder.py`. See the README "Why 1-minute segments" section for
-  the rationale (short segments minimize live-playback lag and
-  worst-case data loss on unclean shutdown; scrubbing responsiveness
-  doesn't scale with segment length).
+  `recorder.py` and is intentionally not configurable. Two things
+  scale with segment length, and both favor short segments:
+  - **Playback latency to "live"**: a segment isn't playable until
+    ffmpeg closes it (the `moov` atom is written on close), so the
+    newest viewable footage is 0 to `segment_length` behind real
+    time. At 1 minute that's an average ~30 second lag.
+  - **Worst-case data loss on unclean shutdown**: if the machine
+    loses power or ffmpeg is SIGKILLed mid-segment, the in-progress
+    file has no `moov` atom and is unplayable — up to
+    `segment_length` of footage from that camera is lost. Clean
+    shutdowns (`docker stop`, Ctrl-C, `docker restart`) finalize
+    the current segment via SIGTERM and do *not* lose data.
+
+  Scrubbing responsiveness does *not* scale with segment length:
+  segments are self-contained MP4 with `moov` at the front, so the
+  browser byte-ranges directly to the nearest keyframe regardless of
+  segment length. Longer segments would save a trivial amount of
+  filesystem and ffprobe overhead, which isn't worth the
+  playback-latency or data-loss cost.
 
 After each segment closes, an inotify `IN_CLOSE_WRITE` watcher on
 the camera dir dispatches a duration-index task that runs `ffprobe`
@@ -223,7 +237,7 @@ cameras:
 ```
 
 `segment_minutes` used to be configurable (1–60) but is now fixed
-at 1 minute in `recorder.py` — see README for why. The `.venv`,
+at 1 minute in `recorder.py` — see the Recording section above. The `.venv`,
 the recorder, the frontend fallback, and the retention math all
 share that assumption via `SEGMENT_SECONDS` on the backend and
 `_segmentDurationMs = 60000` on the frontend.
@@ -687,8 +701,7 @@ timestamps — eliminates gaps regardless of internal
   `baseMediaDecodeTime` values. This caused gaps between
   segments (stalls at boundaries) and misalignment between
   `video.currentTime` and the anchor model (2-second seek
-  loops). Sequence mode auto-advances presentation timestamps
-  and eliminates these issues entirely.
+  loops). Switching to `mode='sequence'` fixed both.
 - Per-camera `AbortController` for fetch cancellation prevents
   stale fetch pileup during rapid scrubs.
 - `videoLoading` flag gates both clock sync (prevents snap-back

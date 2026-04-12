@@ -2,11 +2,11 @@
 
 A lightweight, self-hosted NVR that records RTSP camera streams and provides a web UI for synced multi-camera playback with timeline scrubbing.
 
-- Records via ffmpeg with no video transcoding (`-c:v copy`), near-zero CPU
+- Records via ffmpeg with no transcoding (`-c copy`)
 - 1-minute self-contained MP4 segments with `moov` at front for instant byte-range scrubbing
 - Synced multi-camera grid with a 24-hour timeline that handles DST transitions
 - Rolling retention (configurable, default 7 days)
-- HomeAssistant webhook to toggle cameras on/off
+- Webhook to toggle cameras on/off
 
 See [DESIGN.md](DESIGN.md) for the full design, including the storage
 layout, recording/playback pipelines, and the reasoning against HLS.
@@ -14,8 +14,6 @@ layout, recording/playback pipelines, and the reasoning against HLS.
 ## Requirements
 
 - Linux (uses inotify to index segments as ffmpeg finishes writing them)
-- [mise](https://mise.jdx.dev) (installs uv and prek)
-- ffmpeg
 - **RTSP streams must be H.264 video + AAC audio.** The recorder is
   pure stream copy (`-c copy`) and writes MP4 segments; anything
   other than H.264+AAC will fail to mux. The expected deployment is
@@ -55,31 +53,7 @@ cameras:
     enabled: true
 ```
 
-### Why 1-minute segments
-
-Segment length is fixed at 1 minute and not configurable. Two things
-scale with segment length, and both favor short segments:
-
-- **Playback latency to "live"**: a segment isn't playable until ffmpeg
-  closes it (the `moov` atom is written on close), so the newest
-  viewable footage is 0 to `segment_length` behind real time. At 1
-  minute that's an average ~30 second lag.
-- **Worst-case data loss on unclean shutdown**: if the machine loses
-  power or ffmpeg is SIGKILLed mid-segment, the in-progress file has
-  no `moov` atom and is unplayable — up to `segment_length` of footage
-  from that camera is lost. Clean shutdowns (`docker stop`, Ctrl-C,
-  `docker restart`) finalize the current segment via SIGTERM and do
-  *not* lose data.
-
-Scrubbing responsiveness does *not* scale with segment length:
-segments are self-contained MP4 with `moov` at the front, so the
-browser byte-ranges directly to the nearest keyframe regardless of
-segment length.
-
-Longer segments would save a trivial amount of filesystem and ffprobe
-overhead, which isn't worth the playback-latency or data-loss cost.
-
-## HomeAssistant webhook
+## Webhook
 
 POST to `/api/webhook/{camera_name}` to toggle a camera on or off:
 
@@ -120,6 +94,8 @@ The `/config` volume expects a directory containing `config.yaml`
 `/recordings` volume is the persistent segment store.
 
 ## Development
+
+Requires [mise](https://mise.jdx.dev) (installs uv and prek).
 
 ```bash
 mise install        # install uv and prek
