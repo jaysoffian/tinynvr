@@ -757,7 +757,7 @@ html, body {
                 <div class="fs-play-divider"></div>
                 <div class="fs-timeline">
               <div class="fs-timeline-bar">
-                <template x-for="seg in (segments[cam.name] || [])" :key="'fs-'+seg.filename">
+                <template x-for="seg in timelineSegments(cam)" :key="'fs-'+seg.filename">
                   <div class="fs-timeline-segment" :style="segmentBlockStyle(seg)"></div>
                 </template>
               </div>
@@ -937,6 +937,47 @@ function nvr() {
       return this._nextStartOfDay().getTime() - this._startOfDay().getTime();
     },
 
+    _formatDateStr(d) {
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    },
+
+    _checkDateCrossing() {
+      if (!this.wallTime) return;
+      const wt = this.wallTime.getTime();
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
+      if (wt >= dayStart && wt < dayEnd) return;
+      // wallTime has left the selected day — compute the correct date.
+      const d = new Date(wt);
+      this._switchDisplayDate(this._formatDateStr(d));
+    },
+
+    _switchDisplayDate(newDateStr) {
+      if (newDateStr === this.selectedDate) return;
+      // Don't navigate into the future or before earliest recordings.
+      const today = this._formatDateStr(new Date());
+      if (newDateStr > today) return;
+      if (this.earliestDate && newDateStr < this.earliestDate) return;
+
+      this.selectedDate = newDateStr;
+      // Update weekOffset so the calendar shows the week containing the
+      // new date. buildWeek() uses weekOffset relative to today's week.
+      const todayDate = new Date();
+      todayDate.setHours(0, 0, 0, 0);
+      const todaySunday = new Date(todayDate);
+      todaySunday.setDate(todaySunday.getDate() - todaySunday.getDay());
+      const [y, m, d] = newDateStr.split('-').map(Number);
+      const newDate = new Date(y, m - 1, d);
+      const newSunday = new Date(newDate);
+      newSunday.setDate(newSunday.getDate() - newSunday.getDay());
+      this.weekOffset = Math.round((newSunday - todaySunday) / (7 * 86400000));
+      this.buildWeek();
+      this._startSegmentRefresh();
+      // Re-fetch segments around the new center date. Non-blocking;
+      // the merge logic preserves object identity so playback continues.
+      this.fetchAllSegments();
+    },
+
     // One tick per real-time hour from local midnight to next local
     // midnight, labeled with the local clock hour at that instant.
     // Normal days produce 24 ticks 00..23; spring-ahead produces 23
@@ -1057,17 +1098,24 @@ function nvr() {
     },
 
     _pickInitialWallTime() {
-      // Try to find the earliest segment across all cameras for today
+      // Find the earliest segment within the selected day across all cameras.
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
       let earliest = null;
       for (const cam of this.cameras) {
         const segs = this.segments[cam.name];
-        if (segs && segs.length > 0) {
-          const t = new Date(segs[0].start_time);
-          if (!earliest || t < earliest) earliest = t;
+        if (!segs) continue;
+        for (const seg of segs) {
+          const t = new Date(seg.start_time).getTime();
+          if (t >= dayEnd) break;  // sorted — past selected day
+          if (t >= dayStart) {
+            if (!earliest || t < earliest) earliest = t;
+            break;  // first in-range segment for this cam
+          }
         }
       }
       if (earliest) {
-        this.wallTime = earliest;
+        this.wallTime = new Date(earliest);
       } else {
         this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       }
@@ -1102,51 +1150,79 @@ function nvr() {
       }
     },
 
-    _utcDatesForLocalDate() {
-      // A local date spans up to 2 UTC dates (e.g. EDT midnight = 04:00 UTC)
-      const localStart = this._startOfDay();
-      const localEnd = new Date(localStart.getTime() + this._dayLengthMs() - 1);
-      const dates = new Set([
-        localStart.toISOString().slice(0, 10),
-        localEnd.toISOString().slice(0, 10),
-      ]);
-      return [...dates];
+    _segFetchInFlight: false,
+
+    _threeDayRange() {
+      // Returns { rangeStart, rangeEnd } covering prev + current + next
+      // local days around selectedDate. DST-safe via Date constructor.
+      const [y, m, d] = this.selectedDate.split('-').map(Number);
+      return {
+        rangeStart: new Date(y, m - 1, d - 1),
+        rangeEnd: new Date(y, m - 1, d + 2),
+      };
+    },
+
+    _utcDatesForRange(rangeStart, rangeEnd) {
+      // Enumerate all UTC dates spanned by a local time range.
+      const dates = new Set();
+      for (let t = rangeStart.getTime(); t < rangeEnd.getTime(); t += 86400000) {
+        dates.add(new Date(t).toISOString().slice(0, 10));
+      }
+      // Also include the UTC date just before rangeEnd
+      dates.add(new Date(rangeEnd.getTime() - 1).toISOString().slice(0, 10));
+      return [...dates].sort();
     },
 
     async fetchAllSegments() {
-      const utcDates = this._utcDatesForLocalDate();
-      const dayStart = this._startOfDay().getTime();
-      const dayEnd = dayStart + this._dayLengthMs();
+      if (this._segFetchInFlight) return;
+      this._segFetchInFlight = true;
+      try {
+        const { rangeStart, rangeEnd } = this._threeDayRange();
+        const rangeStartMs = rangeStart.getTime();
+        const rangeEndMs = rangeEnd.getTime();
+        const utcDates = this._utcDatesForRange(rangeStart, rangeEnd);
 
-      const results = await Promise.allSettled(
-        this.cameras.map(async cam => {
-          const allSegs = [];
-          for (const utcDate of utcDates) {
-            const res = await fetch(
-              `/api/cameras/${encodeURIComponent(cam.name)}/segments?date_str=${utcDate}`
-            );
-            const segs = await res.json();
-            allSegs.push(...segs);
-          }
-          // Keep only segments whose start falls within the local date
-          const filtered = allSegs.filter(seg => {
-            const t = new Date(seg.start_time).getTime();
-            return t >= dayStart && t < dayEnd;
+        const results = await Promise.allSettled(
+          this.cameras.map(async cam => {
+            const allSegs = [];
+            for (const utcDate of utcDates) {
+              const res = await fetch(
+                `/api/cameras/${encodeURIComponent(cam.name)}/segments?date_str=${utcDate}`
+              );
+              const segs = await res.json();
+              allSegs.push(...segs);
+            }
+            // Keep only segments within the 3-day local window
+            const filtered = allSegs.filter(seg => {
+              const t = new Date(seg.start_time).getTime();
+              return t >= rangeStartMs && t < rangeEndMs;
+            });
+            filtered.sort((a, b) => a.start_time.localeCompare(b.start_time));
+            return { name: cam.name, segs: filtered };
+          })
+        );
+
+        // Merge preserving object identity so state.currentSegment
+        // references survive across re-fetches.
+        const fresh = {};
+        for (const r of results) {
+          if (r.status !== 'fulfilled') continue;
+          const { name, segs: newSegs } = r.value;
+          const old = this.segments[name] || [];
+          const byFile = new Map(old.map(s => [s.filename, s]));
+          fresh[name] = newSegs.map(s => {
+            const prev = byFile.get(s.filename);
+            if (prev && prev.duration_sec === s.duration_sec) return prev;
+            return s;
           });
-          filtered.sort((a, b) => a.start_time.localeCompare(b.start_time));
-          return { name: cam.name, segs: filtered };
-        })
-      );
-      const fresh = {};
-      for (const r of results) {
-        if (r.status === 'fulfilled') {
-          fresh[r.value.name] = r.value.segs;
         }
+        for (const cam of this.cameras) {
+          if (!(cam.name in fresh)) fresh[cam.name] = [];
+        }
+        this.segments = fresh;
+      } finally {
+        this._segFetchInFlight = false;
       }
-      for (const cam of this.cameras) {
-        if (!(cam.name in fresh)) fresh[cam.name] = [];
-      }
-      this.segments = fresh;
     },
 
     _parseStart(seg) {
@@ -1831,6 +1907,8 @@ function nvr() {
           }
         }
 
+        this._checkDateCrossing();
+
         // Sync all cameras: check segment boundaries, load new segments
         for (let i = 0; i < this.cameras.length; i++) {
           const state = this.camStates[i];
@@ -1930,6 +2008,7 @@ function nvr() {
     _seekByKey(ms) {
       this.wallTime = new Date(this.wallTime.getTime() + ms);
       this._clampWallTime();
+      this._checkDateCrossing();
       this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
@@ -1938,8 +2017,12 @@ function nvr() {
 
     timelineSegments(cam) {
       const segs = this.segments[cam.name] || [];
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
       const isRecording = cam.state === 'recording';
       return segs.filter((seg, i) => {
+        const t = new Date(seg.start_time).getTime();
+        if (t < dayStart || t >= dayEnd) return false;
         // Valid duration: show it
         if (seg.duration_sec > 0) return true;
         // 0 = probed and failed; null = not yet probed.
@@ -1981,6 +2064,7 @@ function nvr() {
     endScrub() {
       if (!this.scrubbing) return;
       this.scrubbing = false;
+      this._checkDateCrossing();
       this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
@@ -2062,6 +2146,7 @@ function nvr() {
       if (!this._fsScrubbing) return;
       this._fsScrubbing = false;
       this._fsScrubEl = null;
+      this._checkDateCrossing();
       this._seekUntil = performance.now() + 500;
       this.loadSegmentsForAll();
     },
