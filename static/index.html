@@ -1330,6 +1330,7 @@ function nvr() {
         videoInitAppended: false,
         audioInitAppended: false,
         objectUrl: null,
+        fetchAbort: null,   // AbortController for canceling stale fetches
       };
     },
 
@@ -1401,6 +1402,12 @@ function nvr() {
 
       state.videoLoading = true;
 
+      // Cancel any in-flight fetch and clear stale queue entries so
+      // rapid scrubs (keyboard or mouse) don't pile up.
+      state.fetchAbort?.abort();
+      state.fetchAbort = new AbortController();
+      state.appendQueue = [];
+
       if (needFlush) {
         state.appendQueue.push({ type: 'flush' });
       }
@@ -1443,6 +1450,8 @@ function nvr() {
       try {
         await state.mediaSourceReady;
         while (state.appendQueue.length > 0) {
+          // Bail if MediaSource was torn down (e.g., date change).
+          if (!state.mediaSource || state.mediaSource.readyState !== 'open') break;
           const op = state.appendQueue.shift();
           if (op.type === 'flush') {
             await this._flushSourceBuffers(state);
@@ -1481,8 +1490,11 @@ function nvr() {
 
     async _fetchSegmentBytes(idx, seg) {
       const cam = this.cameras[idx];
+      const state = this.camStates[idx];
       const url = this.segmentUrl(cam.name, seg);
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        signal: state?.fetchAbort?.signal,
+      });
       if (!res.ok) throw new Error('fetch ' + res.status);
       return await res.arrayBuffer();
     },
@@ -1762,7 +1774,7 @@ function nvr() {
           const v0 = this.getVideo(0);
           const s0 = this.camStates[0];
 
-          if (v0 && s0?.currentSegment && s0.anchorMs != null && !v0.paused && !v0.seeking && v0.readyState >= 3) {
+          if (v0 && s0?.currentSegment && s0.anchorMs != null && !s0.videoLoading && !v0.paused && !v0.seeking && v0.readyState >= 3) {
             // Sync clock from primary video to prevent drift. With MSE,
             // video.currentTime is anchor-relative, so wallMs is just
             // anchor + currentTime.
@@ -1798,7 +1810,7 @@ function nvr() {
             const wt = this.wallTime.getTime();
             if (wt >= segEnd || wt < segStart) {
               this.loadSegmentForCamera(i);
-            } else if (i > 0 && state.anchorMs != null) {
+            } else if (i > 0 && state.anchorMs != null && !state.videoLoading) {
               // Keep non-primary cameras in sync (only seek if drift > 2s).
               // With MSE, video.currentTime is anchor-relative.
               const video = this.getVideo(i);
@@ -1944,7 +1956,9 @@ function nvr() {
       const pct = x / rect.width;
       this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
       this._clampWallTime();
-      this.loadSegmentsForAll();
+      // Don't load segments here — the cursor/time update instantly,
+      // and segments load on mouseup (endScrub). This prevents MSE
+      // flush+fetch+transmux storms during drag.
     },
 
     onTimelineHover(e) {
@@ -2022,7 +2036,7 @@ function nvr() {
       const pct = x / rect.width;
       this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
       this._clampWallTime();
-      this.loadSegmentsForAll();
+      // Don't load segments during drag — load on mouseup (endFsScrub).
     },
 
     // -- Range selection --
