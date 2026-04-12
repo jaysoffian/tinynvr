@@ -140,9 +140,19 @@ without any `emptied` / `loadstart` cycle.
 **Anchor model.** Each camera tracks an `anchorMs` (the wall time
 of the first segment appended to its SourceBuffers). The video
 element's `currentTime` maps to wall time as
-`wallMs = anchorMs + currentTime * 1000`. The primary camera
-(index 0) drives the clock; non-primary cameras are drift-
-corrected if they diverge by > 2 seconds.
+`wallMs = anchorMs + currentTime * 1000`. A **dynamic clock master**
+is re-picked each raf tick: any camera currently rendering valid
+video (has a `currentSegment`, `readyState >= HAVE_FUTURE_DATA`,
+not paused/seeking/loading) qualifies, with hysteresis preferring
+the previous tick's master to avoid flapping. `wallTime` is
+snapped to the master's `currentTime`-derived value every tick,
+preserving the "UI time matches on-screen pixels" invariant. Every
+camera — master included — runs the same hard-seek drift correction
+at a 500ms threshold; the master self-corrects to a no-op because
+`wallTime` was just sourced from it. See the **"Hybrid clock
+design"** section below for why there's no privileged camera and
+why drift correction is hard-seek rather than PI-controlled
+`playbackRate` trimming.
 
 **Prefetch.** After appending the current segment,
 `_enqueuePrefetch` enqueues the next segment (from
@@ -158,22 +168,29 @@ fetch first (per-camera `AbortController`). If the target segment
 is far from the currently buffered range (> 2s outside), the
 SourceBuffers are flushed and re-anchored before appending.
 
-**Loading guards.** While a segment is loading (`videoLoading`),
-the clock freezes `wallTime` at the scrub target instead of
-free-running. The video element is paused before a flush so it
-doesn't auto-play from the wrong position when new buffer data
-appears. Both prevent the snap-back and fast-forward artifacts
-that appeared when the clock drifted ahead of the video during
-loading.
+**Loading guards.** While any segment is loading (`videoLoading`)
+and no camera is rendering, the clock freezes `wallTime` at the
+scrub target instead of free-running. The video element is paused
+before a flush so it doesn't auto-play from the wrong position
+when new buffer data appears. Both prevent the snap-back and
+fast-forward artifacts that appeared when the clock drifted ahead
+of the video during loading.
 
 **Buffer cleanup.** After each successful append, if the buffered
 range exceeds ~5 minutes, old data behind the playhead is trimmed
 lazily via `SourceBuffer.remove()`.
 
-**The `!found`-skip-when-playing fix is preserved.** During live
-playback, if `findSegmentAt` returns null (sub-second rotation
-gap between cameras), the `!found` branch returns silently: the
-last frame stays visible and the clock advances through the gap.
+**The `!found`-skip-when-playing fix is narrow.** During live
+playback, if `findSegmentAt` returns null and `wallTime` is within
+2 seconds past the end of the currently loaded segment, the
+`!found` branch returns silently: the last frame stays visible and
+the clock advances through a sub-second rotation gap. Any further
+"not found" — a deliberate scrub into an empty region, or a real
+multi-minute outage — clears `currentSegment`, pauses the camera's
+video, and lets the clock-master selection pick a different
+camera. Without this narrowing, a scrub into a gap would leave
+camera 0 playing a stale segment and the old static-master clock
+sync would snap `wallTime` backward to where that segment lived.
 
 See the **"Gapless playback investigation"** section below for the
 full list of approaches tried before MSE (double-buffering,
@@ -756,9 +773,11 @@ and the playback layer is substantially more complex.
 - **Sequence-mode drift**: `mode='sequence'` auto-advances
   timestamps, which means sub-second duration mismatches between
   segments accumulate over time (~50ms/segment worst case, ~3s
-  after 1 hour). The primary-camera clock sync and the > 2s
-  drift correction on non-primary cameras bound this. A scrub
-  resets the anchor and eliminates accumulated drift.
+  after 1 hour). The dynamic clock master (see "Hybrid clock
+  design" below) snaps `wallTime` to whichever camera is currently
+  rendering, and a 500ms hard-seek drift correction on all other
+  cameras bounds accumulated divergence. A scrub resets the
+  anchor and eliminates accumulated drift.
 - **Full segment fetch**: the old approach let Safari fetch only
   the moov atom + initial GOPs via byte-range requests (~300 KB
   to start playing). MSE requires the full segment (~12 MB) to
@@ -777,3 +796,218 @@ the current whole-file approach.
 Do not re-try double-buffering (#2), HTTP-cache prefetch (#3),
 blob-URL prefetch (#4), or staggered loads (#5) without reading
 the failure details above.
+
+## Hybrid clock design
+
+The raf-driven playback clock is the most subtle part of the
+frontend. This section documents how it works, why it was
+rewritten in April 2026, and the dead ends explored on the way —
+so "future you" doesn't re-propose any of them.
+
+### The invariant
+
+**The `wallTime` shown in the UI must match the pixels on screen.**
+For an NVR, "14:25:54" in the header has to mean "the frame you
+are looking at was recorded at 14:25:54." If the clock runs ahead
+of the video (because a video element stalled, decoded slowly, or
+was in a gap), the user sees a misleading timestamp. Preserving
+this invariant constrains the design.
+
+### The old static-master design and why it broke
+
+The original clock tick used **camera 0 as a fixed clock master**:
+
+```js
+if (v0 && s0?.currentSegment && !s0.videoLoading && v0.readyState >= 3) {
+  wallTime = s0.anchorMs + v0.currentTime * 1000;  // sync from cam 0
+} else if (!s0.videoLoading) {
+  wallTime += dt * playbackSpeed;                  // free-run
+}
+// else: freeze while cam 0 is loading
+```
+
+Cameras 1–3 were kept in lockstep via a > 2s hard-seek drift
+correction. The choice of camera 0 was arbitrary ("first camera in
+the array"), not principled. Two bugs fell out of that
+arbitrariness:
+
+1. **Scrub-into-gap snap-back.** If the user scrubbed to a time
+   where camera 0 had no footage, `loadSegmentForCamera` hit the
+   `!found` branch and returned early during playback, leaving
+   `state.currentSegment` pointing at the pre-scrub segment. The
+   clock kept reading `v0.currentTime` of that stale segment and
+   snapped `wallTime` backward to where the stale segment lived.
+   Repeated scrubs could dig out of it by luck, but the UX was
+   broken.
+2. **Cam-0-offline kills playback.** If camera 0 was in a
+   multi-minute gap, the clock free-ran while cameras 1–3 played
+   at media rate. `wallTime` drifted relative to their timelines,
+   the > 2s drift correction triggered, and cameras 1–3 visibly
+   jerked back every few seconds for the entire outage. In the
+   user's production config, **camera 1 (index 1)** is the most
+   reliable stream; camera 0's outages routinely broke playback
+   for everyone.
+
+### What was considered
+
+An expert consultation on clock sync / PLL weighed three options:
+
+- **Option A — dynamic master selection.** Still pick a single
+  master each tick, but from any rendering camera with
+  hysteresis. Master drift correction on all slaves.
+- **Option B — `wallTime` as authoritative, videos as slaves.**
+  Clock free-runs via `wallTime += dt * speed` each tick. All
+  cameras drift-correct toward `wallTime`. No privileged camera.
+- **Option C — hybrid.** `wallTime` free-runs EXCEPT when a
+  rendering master exists, in which case it's snapped to the
+  master each tick. Preserves "clock matches pixels" (Option A's
+  property) without a static master (Option B's simplicity).
+
+**Option B was rejected** because of the invariant: when a video
+stalls on a segment append or decoder starvation, pure free-run
+lets `wallTime` run ahead of the actual frame on screen. For an
+NVR, that's a correctness bug.
+
+### What shipped: Option C
+
+Five rules:
+
+1. `wallTime` is authoritative for UI, scrubber, and segment
+   lookups.
+2. Each raf tick picks a **dynamic clock master**: any camera
+   whose `currentSegment` covers `wallTime` and whose `<video>` is
+   ready (`readyState >= HAVE_FUTURE_DATA`, not paused/seeking,
+   not `videoLoading`). Hysteresis prefers the previous tick's
+   master so master selection doesn't flap every frame.
+3. If a master exists, `wallTime` is snapped to
+   `master.anchorMs + master.video.currentTime * 1000` before
+   anything else runs — this is what preserves "UI time matches
+   pixels."
+4. If no master qualifies, distinguish two sub-cases via the
+   segment list:
+   - **Known gap** (no camera has a segment covering `wallTime`):
+     look up `_nextFootageAfter(wallMs)` — the earliest segment
+     start across all cameras strictly greater than `wallMs`. If
+     that's more than 1 second ahead, jump `wallTime` to it and
+     set `_seekUntil = now + 500` so the per-camera sync loop can
+     load the new segments cleanly. Short gaps (< 1s) play through
+     in real time so sub-second ffmpeg rotation hitches don't
+     trigger a skip.
+   - **Stall** (some camera has a segment covering `wallTime` but
+     none is ready yet): if any camera is `videoLoading`, freeze
+     `wallTime` so it doesn't drift past the scrub target while
+     loads are in flight. Otherwise free-run briefly.
+5. Every camera — master included — runs hard-seek drift
+   correction at a **500ms** threshold (lowered from 2s). The
+   master self-corrects to a no-op because `wallTime` was just
+   sourced from it.
+
+### Why hard-seek drift correction instead of PI-controlled `playbackRate`
+
+The expert's actual recommendation was to replace the hard-seek
+rule with a PI controller on `video.playbackRate` — small
+trims like `playbackRate = 1.02` instead of visible seeks.
+Shaka Player, Chromecast multi-room audio, and similar projects
+do this for exactly this kind of multi-stream sync. Seeks cause
+stalls; rate trims are invisible.
+
+**This was tried on Safari and rejected.** A standalone rate-test
+harness (`static/rate_test.html`, reachable at `/rate_test.html`
+with `?debug=1`-style auto-report to `/api/debug/log`) loaded a
+real segment via a plain `<video src=>` element (not MSE) and
+measured effective rate as `Δvideo.currentTime / Δwall` over
+8-second windows at target rates 1.00, 1.02, 1.05, 1.10, 0.98,
+0.90. On Safari 26.3.1 / WebKit 605.1.15 the results were
+incoherent:
+
+```
+target  effective   Δmedia     Δwall    honored?
+1.00×   0.8580      6.8647 s   8.001 s  NO
+1.02×   0.9275      7.4201 s   8.000 s  NO
+1.05×  -0.0249     -0.1990 s   8.001 s  NO (currentTime went BACKWARDS)
+1.10×   0.8972      7.1786 s   8.001 s  NO
+0.98×   0.7812      6.2494 s   8.000 s  NO
+0.90×   0.7075      5.6605 s   8.001 s  NO
+```
+
+Effective rates don't track the target, don't scale linearly, and
+one test reported `currentTime` going *backwards* over 8 seconds
+of wall time — impossible under normal playback. **The same
+harness was then run on Chrome and Firefox and both browsers
+honored every target rate cleanly** (Δmedia ≈ target × Δwall
+within the 0.5% epsilon), so the Safari result is a real WebKit
+limitation, not a harness bug. Safari is the only target browser
+for TinyNVR, so we abandoned the PI-controller idea entirely.
+Keep `rate_test.html` around — if a future WebKit build changes
+this behavior, re-run the same test before proposing any control
+loop.
+
+**Instead:** the 2s hard-seek drift-correction threshold was
+lowered to 500ms. Drift-corrected seeks are visible as brief
+hitches on drifting cameras, but in normal operation all cameras
+track the master closely enough that the threshold rarely fires.
+A 500ms hitch every minute or two under pathological conditions
+is acceptable; invisible 2s UI/pixel desync is not.
+
+### `?test_gap` dev hack
+
+The gap-skip path is hard to exercise in production — it requires
+a simultaneous outage across *every* camera, which is rare
+enough that the user couldn't reproduce it on demand. The main
+UI now accepts a URL parameter:
+
+```
+?debug=1&test_gap=14:30:00-14:35:00
+```
+
+During playback, `_pickClockMaster`, `_anyCamHasFootageAt`, and
+`_nextFootageAfter` pretend the selected day has no footage
+inside the given local-time window. Timeline rendering is
+unaffected (it reads `segments[]` directly), so the fake gap
+only shows up in the clock tick's decisions: the panels flash
+"Offline," a `gap_skip` event lands in `/api/debug/log`, and
+`wallTime` jumps to the window end. Verified end-to-end during
+the April 2026 rewrite.
+
+### Drift telemetry
+
+When `?debug=1` is on, the clock tick emits a `drift` event once
+per second with:
+
+- `clock_ms`: current `wallTime.getTime()`
+- `master`: index of the current clock master (null if none)
+- `spd`: playback speed
+- `cams`: per-camera state — `drift_ms`, `rs`, `p` (paused),
+  `vl` (videoLoading), `seg` (filename or null)
+
+`drift_ms` is `(video.currentTime - (wallTime - anchorMs) / 1000) * 1000`,
+reported as `null` when the camera has no `currentSegment`.
+(Earlier versions of the telemetry omitted the
+`currentSegment` gate and reported stale-anchor garbage like
+`drift_ms: 6131725` for cameras in a gap — fixed.)
+
+A `gap_skip` event is emitted inline whenever the known-gap
+branch fires:
+
+```json
+{"kind":"gap_skip","from_ms":...,"to_ms":...,"span_ms":...}
+```
+
+### Do not re-litigate
+
+- **Don't make camera 0 the master again.** The asymmetry was
+  the bug. Dynamic selection with hysteresis is the fix.
+- **Don't try PI-controlled `playbackRate` on Safari.** See the
+  rate-test results above. If a future WebKit build fixes this,
+  re-run a test harness before building any control loop.
+- **Don't remove the `!found`-narrow-grace (2s past segEnd).** It
+  exists so brief ffmpeg rotation hitches don't clear a camera's
+  `currentSegment` and kick it out of master eligibility — without
+  it, every minute-boundary rotation would cause a master
+  handoff.
+- **Don't use pure free-running `wallTime` (Option B).** The
+  "clock matches pixels" invariant breaks during any video stall.
+- **Don't synthesize fake video for gaps on the backend.** The
+  segment list is already the ground truth for "what footage
+  exists"; the clock tick can just skip through known gaps. Disk
+  synthesis was considered and rejected as needless complexity.

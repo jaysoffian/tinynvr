@@ -2043,16 +2043,22 @@ function nvr() {
             if (wt >= segEnd || wt < segStart) {
               this.loadSegmentForCamera(i);
             } else if (state.anchorMs != null && !state.videoLoading) {
-              // Keep every camera in sync with wallTime (only seek if
-              // drift > 2s). Applies to the clock master too: since
+              // Keep every camera in sync with wallTime via hard-seek
+              // drift correction. Applies to the clock master too: since
               // wallTime was just snapped to the master's currentTime,
-              // the master's drift is zero and no seek fires. With
-              // MSE, video.currentTime is anchor-relative.
+              // the master's drift is zero and no seek fires. With MSE,
+              // video.currentTime is anchor-relative.
+              //
+              // Threshold is 0.5s. See DESIGN.md "Hybrid clock design":
+              // we considered a PI controller on playbackRate for
+              // sub-second corrections, but WebKit's sub-1% rate
+              // trimming is unreliable (see rate_test harness results
+              // in git history), so hard seeks are the only tool.
               const video = this.getVideo(i);
               if (video && !video.seeking && video.readyState >= 3) {
                 const offset = (wt - state.anchorMs) / 1000;
                 if (Number.isFinite(offset) && offset >= 0 &&
-                    Math.abs(video.currentTime - offset) > 2) {
+                    Math.abs(video.currentTime - offset) > 0.5) {
                   video.currentTime = offset;
                 }
               }
@@ -2071,9 +2077,13 @@ function nvr() {
           for (let i = 0; i < this.cameras.length; i++) {
             const s = this.camStates[i];
             const v = this.getVideo(i);
-            const a = s?.anchorMs;
-            const drift_ms = (v && a != null)
-              ? Math.round((v.currentTime - (this.wallTime.getTime() - a) / 1000) * 1000)
+            // Only report drift when the camera actually has a
+            // current segment. anchorMs lingers from prior loads
+            // even after a camera drops into a gap, so gating on
+            // anchorMs alone produces nonsense values like "102
+            // minutes of drift" for offline cameras.
+            const drift_ms = (v && s?.currentSegment && s.anchorMs != null)
+              ? Math.round((v.currentTime - (this.wallTime.getTime() - s.anchorMs) / 1000) * 1000)
               : null;
             cams.push({
               i,
