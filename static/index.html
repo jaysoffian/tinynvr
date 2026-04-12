@@ -1408,6 +1408,12 @@ function nvr() {
           needFlush = true;
         }
       }
+      // Segment starts before the anchor — sequence-mode append would
+      // place it after existing data, making the seek target negative.
+      // Flush so the anchor resets to this earlier segment.
+      if (!needFlush && state.anchorMs != null && segStartMs < state.anchorMs) {
+        needFlush = true;
+      }
 
       state.videoLoading = true;
 
