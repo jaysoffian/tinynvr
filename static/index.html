@@ -693,7 +693,7 @@ html, body {
         <div class="no-recording-overlay"
              x-show="!camStates[idx]?.currentSegment || camStates[idx]?.videoLoading"
              x-cloak>
-          <span x-text="(loading || camStates[idx]?.videoLoading || (segments[cam.name]?.length > 0)) ? 'Loading\u2026' : 'Offline'"></span>
+          <span x-text="(loading || camStates[idx]?.videoLoading) ? 'Loading\u2026' : 'Offline'"></span>
         </div>
         <!-- Fullscreen overlay with controls + timeline -->
         <div class="fs-overlay" x-show="fullscreenIdx === idx" x-cloak @click.stop>
