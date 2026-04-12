@@ -1566,30 +1566,30 @@ function nvr() {
           throw new Error('unsupported video codec ' + type);
         }
         state.videoSB = ms.addSourceBuffer(type);
-        state.videoSB.mode = 'segments';
+        state.videoSB.mode = 'sequence';
       }
       if (!state.audioSB && tm.audioInit && tm.audioCodec) {
         const type = `audio/mp4; codecs="${tm.audioCodec}"`;
         if (MediaSource.isTypeSupported(type)) {
           state.audioSB = ms.addSourceBuffer(type);
-          state.audioSB.mode = 'segments';
+          state.audioSB.mode = 'sequence';
         }
         // If audio codec is unsupported, silently fall through —
         // video-only playback is acceptable.
       }
 
-      // Anchor on first successful append.
+      // Anchor on first successful append. With mode='sequence', the
+      // SourceBuffer auto-advances presentation timestamps — we only
+      // need the anchor to map video.currentTime back to wall time.
       if (state.anchorMs == null) {
         state.anchorMs = this._parseStart(seg).getTime();
       }
-      const offsetSec = (this._parseStart(seg).getTime() - state.anchorMs) / 1000;
 
       if (state.videoSB) {
         if (!state.videoInitAppended && tm.videoInit) {
           await this._appendBytes(state.videoSB, tm.videoInit);
           state.videoInitAppended = true;
         }
-        state.videoSB.timestampOffset = offsetSec;
         for (const chunk of tm.videoChunks) {
           await this._appendBytes(state.videoSB, chunk);
         }
@@ -1599,7 +1599,6 @@ function nvr() {
           await this._appendBytes(state.audioSB, tm.audioInit);
           state.audioInitAppended = true;
         }
-        state.audioSB.timestampOffset = offsetSec;
         for (const chunk of tm.audioChunks) {
           await this._appendBytes(state.audioSB, chunk);
         }
@@ -1645,8 +1644,15 @@ function nvr() {
           }
         });
       }
+      // Reset timestampOffset so the next append in sequence mode
+      // starts at presentation time 0 (matching the fresh anchor).
+      for (const sb of sbs) {
+        try { sb.timestampOffset = 0; } catch (e) {}
+      }
       state.appendedFilenames = new Set();
       state.anchorMs = null;
+      state.videoInitAppended = false;
+      state.audioInitAppended = false;
     },
 
     _seekVideoMSE(idx) {
@@ -1756,7 +1762,7 @@ function nvr() {
           const v0 = this.getVideo(0);
           const s0 = this.camStates[0];
 
-          if (v0 && s0?.currentSegment && s0.anchorMs != null && !v0.paused && !v0.seeking && v0.readyState >= 2) {
+          if (v0 && s0?.currentSegment && s0.anchorMs != null && !v0.paused && !v0.seeking && v0.readyState >= 3) {
             // Sync clock from primary video to prevent drift. With MSE,
             // video.currentTime is anchor-relative, so wallMs is just
             // anchor + currentTime.
@@ -1796,7 +1802,7 @@ function nvr() {
               // Keep non-primary cameras in sync (only seek if drift > 2s).
               // With MSE, video.currentTime is anchor-relative.
               const video = this.getVideo(i);
-              if (video && !video.seeking && video.readyState >= 2) {
+              if (video && !video.seeking && video.readyState >= 3) {
                 const offset = (wt - state.anchorMs) / 1000;
                 if (Number.isFinite(offset) && offset >= 0 &&
                     Math.abs(video.currentTime - offset) > 2) {
