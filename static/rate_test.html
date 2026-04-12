@@ -1,0 +1,177 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>playbackRate drift test</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; padding:20px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  p { margin:4px 0; }
+  code { background:#222; padding:2px 6px; border-radius:3px; }
+  table { border-collapse:collapse; margin-top:12px; }
+  th, td { padding:6px 12px; border:1px solid #333; text-align:right; font-family:monospace; font-size:13px; }
+  th { background:#222; }
+  td.label { text-align:left; }
+  video { display:block; margin-top:12px; width:320px; background:#000; }
+  .ok { color:#4f9; }
+  .bad { color:#f66; }
+  .pending { color:#fc4; }
+  #status { margin-top:8px; min-height:1.2em; }
+</style>
+</head>
+<body>
+<h1>playbackRate drift test (Safari / WebKit)</h1>
+<p>Measures whether <code>video.playbackRate</code> adjustments close to 1.0 are
+honored by WebKit on MSE-less <code>&lt;video&gt;</code> playback of a real NVR
+segment. For each target rate, lets playback run ~8 seconds of wall time and
+computes the effective rate as <code>Δvideo.currentTime / Δwall</code>. Results
+are POSTed to <code>/api/debug/log</code> (pull with
+<code>curl .../api/debug/log</code>).</p>
+<p>Segment: <code id="seg">(loading…)</code></p>
+<div id="status" class="pending">Starting…</div>
+<table id="results">
+  <thead>
+    <tr><th class="label">Target rate</th><th>Effective</th><th>Δ media (s)</th><th>Δ wall (s)</th><th>Honored?</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+<video id="v" muted playsinline preload="auto"></video>
+
+<script>
+const TESTS = [1.00, 1.02, 1.05, 1.10, 0.98, 0.90];
+const RUN_SECONDS = 8;
+const EPSILON = 0.005;  // effective rate must be within 0.5% of target to "honor"
+
+const video = document.getElementById('v');
+const statusEl = document.getElementById('status');
+const resultsBody = document.querySelector('#results tbody');
+const segEl = document.getElementById('seg');
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || '';
+}
+
+async function postDebug(event) {
+  try {
+    await fetch('/api/debug/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: [{
+        wallMs: Date.now(),
+        perfMs: Math.round(performance.now()),
+        ...event,
+      }] }),
+      keepalive: true,
+    });
+  } catch (e) {}
+}
+
+function appendRow(target, effective, dMedia, dWall, honored) {
+  const tr = document.createElement('tr');
+  const fmt = n => n == null ? '—' : n.toFixed(4);
+  tr.innerHTML =
+    `<td class="label">${target.toFixed(2)}×</td>` +
+    `<td>${fmt(effective)}</td>` +
+    `<td>${fmt(dMedia)}</td>` +
+    `<td>${fmt(dWall)}</td>` +
+    `<td class="${honored ? 'ok' : 'bad'}">${honored ? 'yes' : 'NO'}</td>`;
+  resultsBody.appendChild(tr);
+}
+
+async function pickSegment() {
+  const cams = await (await fetch('/api/cameras')).json();
+  if (!cams.length) throw new Error('no cameras configured');
+  const urlDate = new URLSearchParams(location.search).get('date');
+  const candidateDates = [];
+  if (urlDate) candidateDates.push(urlDate);
+  const d = new Date();
+  const today = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  if (!candidateDates.includes(today)) candidateDates.push(today);
+  const yest = new Date(d.getTime() - 86400000);
+  candidateDates.push(`${yest.getFullYear()}-${String(yest.getMonth()+1).padStart(2,'0')}-${String(yest.getDate()).padStart(2,'0')}`);
+
+  for (const cam of cams) {
+    for (const date of candidateDates) {
+      const segs = await (await fetch(`/api/cameras/${encodeURIComponent(cam.name)}/segments?date_str=${date}`)).json();
+      const usable = segs.find(s => s.duration_sec >= RUN_SECONDS + 2);
+      if (usable) return { cam: cam.name, date, seg: usable };
+    }
+  }
+  throw new Error('no usable segment found');
+}
+
+function waitForCanPlay() {
+  return new Promise((resolve, reject) => {
+    if (video.readyState >= 3) return resolve();
+    const onCan = () => { cleanup(); resolve(); };
+    const onErr = () => { cleanup(); reject(new Error('video error')); };
+    const cleanup = () => {
+      video.removeEventListener('canplay', onCan);
+      video.removeEventListener('error', onErr);
+    };
+    video.addEventListener('canplay', onCan);
+    video.addEventListener('error', onErr);
+  });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function runRateTest(target) {
+  // Seek to a stable point away from the segment edges.
+  video.pause();
+  video.currentTime = 1.0;
+  await sleep(100);
+  video.playbackRate = target;
+  const startMedia = video.currentTime;
+  const startWall = performance.now();
+  await video.play();
+  await sleep(RUN_SECONDS * 1000);
+  video.pause();
+  const dMedia = video.currentTime - startMedia;
+  const dWall = (performance.now() - startWall) / 1000;
+  const effective = dMedia / dWall;
+  const honored = Math.abs(effective - target) < EPSILON;
+  appendRow(target, effective, dMedia, dWall, honored);
+  await postDebug({
+    kind: 'rate_test',
+    target, effective,
+    delta_media_s: Number(dMedia.toFixed(4)),
+    delta_wall_s: Number(dWall.toFixed(4)),
+    honored,
+    ua: navigator.userAgent,
+  });
+  return { target, effective, honored };
+}
+
+async function main() {
+  try {
+    setStatus('Picking a segment…', 'pending');
+    const { cam, date, seg } = await pickSegment();
+    segEl.textContent = `${cam} / ${seg.filename} (${seg.duration_sec}s, ${date})`;
+    video.src = `/api/segments/${encodeURIComponent(cam)}/${encodeURIComponent(seg.filename)}`;
+    setStatus('Waiting for canplay…', 'pending');
+    await waitForCanPlay();
+    for (const target of TESTS) {
+      setStatus(`Running ${target.toFixed(2)}× …`, 'pending');
+      await runRateTest(target);
+    }
+    const all = Array.from(resultsBody.querySelectorAll('tr'));
+    const honored = all.filter(tr => tr.lastElementChild.textContent === 'yes').length;
+    const verdict = honored === TESTS.length
+      ? 'WebKit honors all tested rates — PI controller path is viable.'
+      : honored === 1 && TESTS[0] === 1.00
+        ? 'WebKit only honored 1.0 — sub-unity rate trimming is a no-op on this build. Use hard-seek correction.'
+        : `WebKit honored ${honored}/${TESTS.length} rates — partial support. Check table for which.`;
+    setStatus(verdict, honored === TESTS.length ? 'ok' : 'bad');
+    await postDebug({ kind: 'rate_test_verdict', honored, total: TESTS.length, ua: navigator.userAgent });
+  } catch (e) {
+    setStatus(`Failed: ${e.message}`, 'bad');
+    await postDebug({ kind: 'rate_test_error', message: e.message });
+  }
+}
+
+main();
+</script>
+</body>
+</html>
