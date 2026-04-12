@@ -1966,6 +1966,12 @@ function nvr() {
             if (!this._anyCamHasFootageAt(wallMs)) {
               const nextMs = this._nextFootageAfter(wallMs);
               if (nextMs != null && nextMs - wallMs > 1000) {
+                this._debug({
+                  kind: 'gap_skip',
+                  from_ms: wallMs,
+                  to_ms: nextMs,
+                  span_ms: nextMs - wallMs,
+                });
                 this.wallTime = new Date(nextMs);
                 // Let cameras load the new segments before the clock
                 // block runs again — same settling treatment as a scrub.
@@ -2025,6 +2031,39 @@ function nvr() {
               }
             }
           }
+        }
+
+        // Drift telemetry (throttled). When ?debug=1 is on, emit a
+        // per-camera snapshot once per second: how far each video's
+        // currentTime lags or leads the shared wallTime, whether it's
+        // the clock master, and basic media-element state. Makes drift
+        // problems visible in the debug log without a UI overlay.
+        if (this._debugEnabled && (now - (this._lastDriftLogPerf || 0)) >= 1000) {
+          this._lastDriftLogPerf = now;
+          const cams = [];
+          for (let i = 0; i < this.cameras.length; i++) {
+            const s = this.camStates[i];
+            const v = this.getVideo(i);
+            const a = s?.anchorMs;
+            const drift_ms = (v && a != null)
+              ? Math.round((v.currentTime - (this.wallTime.getTime() - a) / 1000) * 1000)
+              : null;
+            cams.push({
+              i,
+              drift_ms,
+              rs: v ? v.readyState : null,
+              p: v ? (v.paused ? 1 : 0) : null,
+              vl: s?.videoLoading ? 1 : 0,
+              seg: s?.currentSegment?.filename || null,
+            });
+          }
+          this._debug({
+            kind: 'drift',
+            clock_ms: this.wallTime.getTime(),
+            master: this._clockMasterIdx,
+            spd: this.playbackSpeed,
+            cams,
+          });
         }
 
         this._clockId = requestAnimationFrame(tick);
