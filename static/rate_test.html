@@ -28,7 +28,8 @@ computes the effective rate as <code>Δvideo.currentTime / Δwall</code>. Result
 are POSTed to <code>/api/debug/log</code> (pull with
 <code>curl .../api/debug/log</code>).</p>
 <p>Segment: <code id="seg">(loading…)</code></p>
-<div id="status" class="pending">Starting…</div>
+<button id="start" style="margin:8px 0;padding:10px 16px;font-size:14px;cursor:pointer;background:#4f9;color:#111;border:0;border-radius:4px;">Start test</button>
+<div id="status" class="pending">Click "Start test" to begin — Safari requires a user gesture before playback.</div>
 <table id="results">
   <thead>
     <tr><th class="label">Target rate</th><th>Effective</th><th>Δ media (s)</th><th>Δ wall (s)</th><th>Honored?</th></tr>
@@ -46,6 +47,7 @@ const video = document.getElementById('v');
 const statusEl = document.getElementById('status');
 const resultsBody = document.querySelector('#results tbody');
 const segEl = document.getElementById('seg');
+const startBtn = document.getElementById('start');
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -124,50 +126,45 @@ function waitForEvent(target, eventName, timeoutMs, label) {
   });
 }
 
-async function loadSegment(url) {
+async function primeSegment(url) {
   // Attach src and explicitly kick off loading. Safari's preload=auto
   // is best-effort; video.load() is load-bearing on WebKit to actually
-  // start the fetch for a freshly-assigned src.
+  // start the fetch for a freshly-assigned src. Called before the
+  // user gesture so the video has readyState >= 1 by the time the
+  // click handler calls play() synchronously.
   video.src = url;
   video.load();
-  if (video.readyState < 1) {
-    setStatus('Loading metadata…', 'pending');
-    await waitForEvent(video, 'loadedmetadata', 15000, 'loadedmetadata');
-  }
-  // Nudge playback to force buffering past metadata. Safari allows
-  // muted autoplay by policy, but if the browser is offered the video
-  // without play() it may stall at readyState 1 indefinitely.
-  setStatus('Starting buffer (muted autoplay)…', 'pending');
-  try {
-    await video.play();
-  } catch (e) {
-    throw new Error(`play() rejected: ${e.message}`);
-  }
-  // Wait for playback to actually advance past a frame so seeks work.
+  setStatus('Loading metadata…', 'pending');
+  await waitForEvent(video, 'loadedmetadata', 15000, 'loadedmetadata');
+}
+
+async function waitForLoadedData() {
+  // After the user-gesture play() kicks buffering, wait for
+  // readyState >= 2 so subsequent seeks resolve quickly.
   if (video.readyState < 2) {
     await waitForEvent(video, 'loadeddata', 15000, 'loadeddata');
   }
-  video.pause();
 }
 
 async function seekTo(t) {
-  if (Math.abs(video.currentTime - t) < 0.01) return;
+  if (Math.abs(video.currentTime - t) < 0.2) return;
   video.currentTime = t;
   await waitForEvent(video, 'seeked', 5000, `seek to ${t}`);
 }
 
 async function runRateTest(target, startTime) {
+  // Video stays in the "playing" state across the whole test suite;
+  // we only seek and change playbackRate between iterations. This
+  // avoids calling play() after an await, which would be outside the
+  // user-gesture context and rejected by WebKit.
   await seekTo(startTime);
   video.playbackRate = target;
+  // Small settle so the playhead is actually at startTime and the
+  // rate change has taken effect before we sample.
+  await sleep(100);
   const startMedia = video.currentTime;
   const startWall = performance.now();
-  try {
-    await video.play();
-  } catch (e) {
-    throw new Error(`play() at rate ${target}: ${e.message}`);
-  }
   await sleep(RUN_SECONDS * 1000);
-  video.pause();
   const dMedia = video.currentTime - startMedia;
   const dWall = (performance.now() - startWall) / 1000;
   const effective = dMedia / dWall;
@@ -184,12 +181,28 @@ async function runRateTest(target, startTime) {
   return { target, effective, honored };
 }
 
-async function main() {
+let _segInfo = null;
+
+async function prepare() {
   try {
     setStatus('Picking a segment…', 'pending');
     const { cam, date, seg } = await pickSegment();
+    _segInfo = { cam, date, seg };
     segEl.textContent = `${cam} / ${seg.filename} (${seg.duration_sec}s, ${date})`;
-    await loadSegment(`/api/segments/${encodeURIComponent(cam)}/${encodeURIComponent(seg.filename)}`);
+    await primeSegment(`/api/segments/${encodeURIComponent(cam)}/${encodeURIComponent(seg.filename)}`);
+    setStatus('Ready — click "Start test" to begin.', 'ok');
+    startBtn.disabled = false;
+  } catch (e) {
+    setStatus(`Prep failed: ${e.message}`, 'bad');
+    startBtn.disabled = true;
+    await postDebug({ kind: 'rate_test_error', stage: 'prepare', message: e.message });
+  }
+}
+
+async function runAll() {
+  try {
+    const { seg } = _segInfo;
+    await waitForLoadedData();
     // Interleave tests across the segment so each one has fresh buffer
     // ahead of it instead of re-measuring the same 8s window.
     let startTime = 1.0;
@@ -210,11 +223,27 @@ async function main() {
     await postDebug({ kind: 'rate_test_verdict', honored, total: TESTS.length, ua: navigator.userAgent });
   } catch (e) {
     setStatus(`Failed: ${e.message}`, 'bad');
-    await postDebug({ kind: 'rate_test_error', message: e.message });
+    await postDebug({ kind: 'rate_test_error', stage: 'run', message: e.message });
   }
 }
 
-main();
+startBtn.disabled = true;
+prepare();
+
+startBtn.addEventListener('click', () => {
+  startBtn.disabled = true;
+  startBtn.style.display = 'none';
+  // Kick play() synchronously inside the user-gesture handler so
+  // WebKit accepts it. The returned promise is awaited asynchronously
+  // inside runAll(); the important part is that play() is called in
+  // this exact tick, not after an await.
+  const playPromise = video.play();
+  playPromise.catch(async (e) => {
+    setStatus(`play() rejected: ${e.message}`, 'bad');
+    await postDebug({ kind: 'rate_test_error', stage: 'user_gesture_play', message: e.message });
+  });
+  runAll();
+}, { once: true });
 </script>
 </body>
 </html>
