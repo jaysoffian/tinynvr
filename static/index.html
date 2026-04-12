@@ -880,6 +880,7 @@ function nvr() {
     fullscreenIdx: null,
     unmutedIdx: null,
     scrubbing: false,
+    _clockMasterIdx: null,  // camera whose video drives wallTime this tick; recomputed each tick with hysteresis
     _clockId: null,
     _refreshId: null,
     weekOffset: 0,
@@ -1256,6 +1257,61 @@ function nvr() {
         }
       }
       return earliest === Infinity ? 0 : earliest;
+    },
+
+    _camIsMasterCandidate(idx) {
+      // A camera can drive the clock if it's actively rendering a
+      // segment that covers wallTime. Used by _pickClockMaster.
+      const s = this.camStates[idx];
+      const v = this.getVideo(idx);
+      if (!v || !s) return false;
+      if (!s.currentSegment || s.anchorMs == null) return false;
+      if (s.videoLoading) return false;
+      if (v.paused || v.seeking) return false;
+      return v.readyState >= 3;
+    },
+
+    _pickClockMaster() {
+      // Pick any camera currently rendering valid video. Hysteresis:
+      // prefer the previous master if it still qualifies, so we don't
+      // flap between cameras every frame when several are candidates.
+      const prev = this._clockMasterIdx;
+      if (prev != null && this._camIsMasterCandidate(prev)) return prev;
+      for (let i = 0; i < this.cameras.length; i++) {
+        if (this._camIsMasterCandidate(i)) return i;
+      }
+      return null;
+    },
+
+    _anyCamHasFootageAt(wallMs) {
+      // Segment-list query: does any camera have a recorded segment
+      // covering this instant? Distinguishes a real multi-camera gap
+      // (no footage exists) from a transient stall (footage exists,
+      // the video element just isn't ready yet).
+      const t = new Date(wallMs);
+      for (const cam of this.cameras) {
+        if (this.findSegmentAt(cam.name, t)) return true;
+      }
+      return false;
+    },
+
+    _nextFootageAfter(wallMs) {
+      // Earliest segment start across all cameras strictly after
+      // wallMs, or null if no more footage exists in the loaded set.
+      // Used to jump the clock forward across a gap.
+      let earliest = null;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        for (const seg of segs) {
+          if (seg.duration_sec <= 0) continue;
+          const start = this._parseStart(seg).getTime();
+          if (start > wallMs) {
+            if (earliest == null || start < earliest) earliest = start;
+            break;  // segments are sorted — first match is this cam's earliest
+          }
+        }
+      }
+      return earliest;
     },
 
     _clampWallTime() {
@@ -1883,24 +1939,47 @@ function nvr() {
         const settling = now < this._seekUntil;
 
         if (!this.scrubbing && !this._fsScrubbing && !settling) {
-          const v0 = this.getVideo(0);
-          const s0 = this.camStates[0];
+          // Pick any camera currently rendering valid video as the
+          // clock master. This invariant preserves "the timestamp in
+          // the UI matches the pixels on screen": wallTime is snapped
+          // to the master's currentTime so the displayed clock is
+          // never ahead of the frame it describes.
+          const masterIdx = this._pickClockMaster();
+          this._clockMasterIdx = masterIdx;
 
-          if (v0 && s0?.currentSegment && s0.anchorMs != null && !s0.videoLoading && !v0.paused && !v0.seeking && v0.readyState >= 3) {
-            // Sync clock from primary video to prevent drift. With MSE,
-            // video.currentTime is anchor-relative, so wallMs is just
-            // anchor + currentTime.
-            this.wallTime = new Date(s0.anchorMs + v0.currentTime * 1000);
-          } else if (!s0?.videoLoading) {
-            // Video not usable — free-run the clock. But NOT while a
-            // new segment is loading: free-running during a load causes
-            // wallTime to drift ahead of the scrub target, then the
-            // video "catches up" at apparent high speed once it loads.
-            this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
+          if (masterIdx != null) {
+            const v = this.getVideo(masterIdx);
+            const s = this.camStates[masterIdx];
+            this.wallTime = new Date(s.anchorMs + v.currentTime * 1000);
+          } else {
+            // No camera is currently rendering. Two cases:
+            //  (1) Known gap — the segment list says no camera has
+            //      footage covering wallTime. Skip gaps longer than
+            //      1s by jumping wallTime to the next recorded
+            //      footage across all cameras; play through shorter
+            //      ones in real time (brief ffmpeg rotation hitches).
+            //  (2) Stall — cameras have footage here but none is
+            //      ready yet (loading, seeking, initial startup).
+            //      Freeze if any load is in flight so wallTime
+            //      doesn't drift past the target; otherwise free-run.
+            const wallMs = this.wallTime.getTime();
+            if (!this._anyCamHasFootageAt(wallMs)) {
+              const nextMs = this._nextFootageAfter(wallMs);
+              if (nextMs != null && nextMs - wallMs > 1000) {
+                this.wallTime = new Date(nextMs);
+                // Let cameras load the new segments before the clock
+                // block runs again — same settling treatment as a scrub.
+                this._seekUntil = performance.now() + 500;
+              } else {
+                this.wallTime = new Date(wallMs + dt * this.playbackSpeed * 1000);
+              }
+            } else {
+              const anyLoading = Object.values(this.camStates).some(s => s?.videoLoading);
+              if (!anyLoading) {
+                this.wallTime = new Date(wallMs + dt * this.playbackSpeed * 1000);
+              }
+            }
           }
-          // When s0.videoLoading: wallTime stays frozen at the scrub
-          // target. Resumes when the load completes and clock syncs
-          // from the correctly positioned video.
 
           // Stop at end of recordings
           const latest = this._latestEnd();
@@ -1930,9 +2009,12 @@ function nvr() {
             const wt = this.wallTime.getTime();
             if (wt >= segEnd || wt < segStart) {
               this.loadSegmentForCamera(i);
-            } else if (i > 0 && state.anchorMs != null && !state.videoLoading) {
-              // Keep non-primary cameras in sync (only seek if drift > 2s).
-              // With MSE, video.currentTime is anchor-relative.
+            } else if (state.anchorMs != null && !state.videoLoading) {
+              // Keep every camera in sync with wallTime (only seek if
+              // drift > 2s). Applies to the clock master too: since
+              // wallTime was just snapped to the master's currentTime,
+              // the master's drift is zero and no seek fires. With
+              // MSE, video.currentTime is anchor-relative.
               const video = this.getVideo(i);
               if (video && !video.seeking && video.readyState >= 3) {
                 const offset = (wt - state.anchorMs) / 1000;
