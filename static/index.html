@@ -635,7 +635,7 @@ html, body {
           <span class="wp-day-num" x-text="day.num"></span>
         </div>
       </template>
-      <button class="wp-arrow" @click="weekOffset++; buildWeek()">&rsaquo;</button>
+      <button class="wp-arrow" :style="!canGoForward && 'opacity:0.2;pointer-events:none'" @click="weekOffset++; buildWeek()">&rsaquo;</button>
     </div>
     <button class="topbar-play" @click="togglePlay">
       <svg x-show="!playing" viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><polygon points="6,3 20,12 6,21"/></svg>
@@ -887,6 +887,7 @@ function nvr() {
     earliestDate: null,
     version: '',
     canGoBack: true,
+    canGoForward: false,
     hoverPct: null,    // 0-100 timeline position during hover, null when not hovering
     hoverTime: null,   // Date at hover position
 
@@ -960,17 +961,14 @@ function nvr() {
       if (this.earliestDate && newDateStr < this.earliestDate) return;
 
       this.selectedDate = newDateStr;
-      // Update weekOffset so the calendar shows the week containing the
-      // new date. buildWeek() uses weekOffset relative to today's week.
+      // Set weekOffset so the trailing 7-day window includes newDate.
+      // weekOffset 0 = window ends at today; each decrement shifts 7 days back.
       const todayDate = new Date();
       todayDate.setHours(0, 0, 0, 0);
-      const todaySunday = new Date(todayDate);
-      todaySunday.setDate(todaySunday.getDate() - todaySunday.getDay());
       const [y, m, d] = newDateStr.split('-').map(Number);
       const newDate = new Date(y, m - 1, d);
-      const newSunday = new Date(newDate);
-      newSunday.setDate(newSunday.getDate() - newSunday.getDay());
-      this.weekOffset = Math.round((newSunday - todaySunday) / (7 * 86400000));
+      const daysBack = Math.round((todayDate - newDate) / 86400000);
+      this.weekOffset = -Math.floor(daysBack / 7);
       this.buildWeek();
       this._startSegmentRefresh();
       // Re-fetch segments around the new center date. Non-blocking;
@@ -1003,30 +1001,28 @@ function nvr() {
       const DAY_LABELS = ['S','M','T','W','T','F','S'];
       const today = new Date();
       today.setHours(0,0,0,0);
-      const sunday = new Date(today);
-      sunday.setDate(sunday.getDate() - sunday.getDay() + this.weekOffset * 7);
+      // Trailing 7-day window: rightmost day is today + weekOffset * 7,
+      // capped at today so future days are never shown.
+      const endDay = new Date(today);
+      endDay.setDate(endDay.getDate() + this.weekOffset * 7);
+      if (endDay > today) endDay.setTime(today.getTime());
       const days = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(sunday);
+      for (let i = -6; i <= 0; i++) {
+        const d = new Date(endDay);
         d.setDate(d.getDate() + i);
-        const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const iso = this._formatDateStr(d);
         days.push({
           iso,
-          label: DAY_LABELS[i],
+          label: DAY_LABELS[d.getDay()],
           num: d.getDate(),
           isToday: d.getTime() === today.getTime(),
-          isFuture: d > today,
+          isFuture: false,
           beforeEarliest: this.earliestDate ? iso < this.earliestDate : false,
         });
       }
       this.weekDays = days;
-      // Disable back arrow if the entire previous week would be before earliest
-      if (this.earliestDate) {
-        const prevSat = new Date(sunday);
-        prevSat.setDate(prevSat.getDate() - 1);
-        const prevSatIso = `${prevSat.getFullYear()}-${String(prevSat.getMonth()+1).padStart(2,'0')}-${String(prevSat.getDate()).padStart(2,'0')}`;
-        this.canGoBack = prevSatIso >= this.earliestDate;
-      }
+      this.canGoBack = !this.earliestDate || days[0].iso > this.earliestDate;
+      this.canGoForward = this.weekOffset < 0;
     },
 
     get gridColumns() {
