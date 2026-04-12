@@ -1306,21 +1306,7 @@ function nvr() {
     },
 
     loadSegmentsForAll() {
-      // Stagger by 100ms per camera index. When two cameras share an
-      // ffmpeg rotation boundary and both need to load at the same
-      // instant, Safari's media pipeline contends — concurrent loads
-      // take ~3x as long as solo loads (measured in debug logs).
-      // Offsetting the loads spreads the per-camera flash over a
-      // longer window instead of stacking them on top of each other.
-      // Cam 0 runs synchronously so the primary clock source stays
-      // tight; others are deferred.
-      this.cameras.forEach((_, idx) => {
-        if (idx === 0) {
-          this.loadSegmentForCamera(idx);
-        } else {
-          setTimeout(() => this.loadSegmentForCamera(idx), idx * 100);
-        }
-      });
+      this.cameras.forEach((_, idx) => this.loadSegmentForCamera(idx));
     },
 
     loadSegmentForCamera(idx) {
