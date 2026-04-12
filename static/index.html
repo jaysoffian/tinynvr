@@ -1425,17 +1425,27 @@ function nvr() {
       const found = this.findSegmentAt(cam.name, this.wallTime);
 
       if (!found) {
-        // During live playback, wallTime can briefly land in a gap
-        // between segments (a missing/failed segment, or sub-second
-        // ffmpeg rotation drift). Leave the current frame and stale
-        // state in place; the free-running clock will advance out of
-        // the gap and the next tick will find a real segment. Only
-        // clear when not playing — an explicit scrub into an empty
-        // region, or a day switch, should actually blank out.
-        if (this.playing) return;
+        // Distinguish a natural rotation gap (sub-second ffmpeg drift
+        // just past the current segment's end) from an explicit scrub
+        // into an empty region. For the former, leave stale state so
+        // the free-running clock walks out of the gap. For the latter,
+        // clear state and pause the video — otherwise the cam-0 clock
+        // sync in _startClock keeps reading the stale video position
+        // and snaps wallTime back to where the old segment lives.
+        const curSeg = state.currentSegment;
+        if (this.playing && curSeg) {
+          const segs = this.segments[cam.name] || [];
+          const i = segs.indexOf(curSeg);
+          if (i >= 0) {
+            const segEnd = this._segEnd(segs, i);
+            const wt = this.wallTime.getTime();
+            if (wt >= segEnd && wt < segEnd + 2000) return;
+          }
+        }
         state.currentSegment = null;
         state.nextSegment = null;
         state.videoLoading = false;
+        if (video && !video.paused) video.pause();
         return;
       }
 
