@@ -112,36 +112,59 @@ whichever segment covers it.
   show 23 ticks (spring ahead, one hour absent) or 25 ticks (fall
   back, one hour repeated) instead of misaligned labels.
 
-### Frontend: single `<video>` per panel
+### Frontend: MSE playback via mp4box.js
 
-Each camera panel renders **one `<video>` element**. When the
-segment ends, `onended` fires, `_onSegmentEnd` advances `wallTime`
-to the next segment's start, and `loadSegmentForCamera` sets
-`video.src = nextUrl`, which triggers `loadedmetadata` and
-playback resumes. There's a ~100–300ms gap at each segment
-boundary while the browser fetches, parses, and decodes the new
-file. For a 1-minute segment length that's a minor hitch once per
-minute, which is acceptable.
+Each camera panel renders **one `<video>` element** backed by a
+`MediaSource` with separate video and audio `SourceBuffer`s (both
+in `mode='sequence'`). Segments are fetched as full ArrayBuffers,
+fragmented in-browser by [mp4box.js](https://github.com/gpac/mp4box.js)
+(0.5.3, ~156 KB, vendored via Makefile), and appended to the
+SourceBuffers. Segment boundaries are gapless — the next segment's
+data is already in the buffer via prefetch, so playback continues
+without any `emptied` / `loadstart` cycle.
 
-During that gap, `loadSegmentForCamera`'s `!found` branch used to
-unconditionally clear the `<video>` element if `findSegmentAt`
-returned null at the current wallTime — which happened for any
-camera whose segments had a sub-second rotation drift or a
-failed/missing segment at the transition moment. That produced a
-brief "Offline" overlay flash. Now, during live playback (`this.playing
-=== true`), the `!found` branch returns silently: the last frame
-stays visible and the free-running clock advances wallTime out of
-the gap, so the next tick finds a real segment and resumes
-playback without ever clearing the video element.
+**Anchor model.** Each camera tracks an `anchorMs` (the wall time
+of the first segment appended to its SourceBuffers). The video
+element's `currentTime` maps to wall time as
+`wallMs = anchorMs + currentTime * 1000`. The primary camera
+(index 0) drives the clock; non-primary cameras are drift-
+corrected if they diverge by > 2 seconds.
+
+**Prefetch.** After appending the current segment,
+`_enqueuePrefetch` enqueues the next segment (from
+`findNextSegment`). The append loop processes both sequentially.
+When playback reaches the boundary, the next segment is already
+buffered and playback continues without interruption.
+
+**Scrub.** Timeline scrubs (`_scrubToPoint`, `_fsScrubToPoint`)
+only update `wallTime` and the cursor during drag — segment loads
+are deferred to mouseup (`endScrub` / `endFsScrub`). Keyboard
+scrubs (`_seekByKey`) load immediately but abort any in-flight
+fetch first (per-camera `AbortController`). If the target segment
+is far from the currently buffered range (> 2s outside), the
+SourceBuffers are flushed and re-anchored before appending.
+
+**Loading guards.** While a segment is loading (`videoLoading`),
+the clock freezes `wallTime` at the scrub target instead of
+free-running. The video element is paused before a flush so it
+doesn't auto-play from the wrong position when new buffer data
+appears. Both prevent the snap-back and fast-forward artifacts
+that appeared when the clock drifted ahead of the video during
+loading.
+
+**Buffer cleanup.** After each successful append, if the buffered
+range exceeds ~5 minutes, old data behind the playhead is trimmed
+lazily via `SourceBuffer.remove()`.
+
+**The `!found`-skip-when-playing fix is preserved.** During live
+playback, if `findSegmentAt` returns null (sub-second rotation
+gap between cameras), the `!found` branch returns silently: the
+last frame stays visible and the clock advances through the gap.
 
 See the **"Gapless playback investigation"** section below for the
-full list of approaches we tried (double-buffering, HTTP-cache
-prefetch, blob-URL prefetch, `?debug=1` instrumentation, HAR
-captures), why each failed, and the current state of knowledge. If
-you're picking up this problem, start there — all the false starts
-are captured so you don't have to rediscover them. The "Why not
-HLS?" section farther down covers the one approach that was tried
-all the way to a deployable branch and backed out.
+full list of approaches tried before MSE (double-buffering,
+HTTP-cache prefetch, blob-URL prefetch, staggered loads), why each
+failed, and the trade-offs of the current MSE approach.
 
 ## Retention
 
@@ -589,68 +612,104 @@ not the primary cause of the flash.
 **Outcome.** Reverted. `da2c41a1f6` restores plain
 `video.src = httpUrl` with no prefetch.
 
-### Still on the table, not yet tried
+### Failed approach #5: Staggered loads (b42e903a46 → afa7572382)
 
-**Approach #5: Staggered blob-URL loads.** The concurrent
-penalty might be dodged by delaying the second camera's load by
-~100–200ms so they never hit the metadata-parse path
-simultaneously. Each camera would flash for ~190ms (solo speed)
-but they'd flash at slightly different times. I genuinely don't
-know whether the user's eye would find 4 sequential 190ms
-flashes less annoying than 2 simultaneous 600ms flashes — this
-is a "just try it" experiment. Minimal code change: wrap each
-`loadSegmentForCamera(idx)` call in `loadSegmentsForAll` with
-`setTimeout(..., idx * 100)`.
+**Theory.** Delay each camera's `loadSegmentForCamera` call by
+`idx * 100ms` so concurrent transitions don't hit Safari's
+metadata-parse path simultaneously. Each camera would flash for
+~190ms (solo speed) at slightly staggered times instead of two
+cameras blocking each other for ~600ms.
 
-**Approach #6: MSE via a JS-side transmuxer (`mux.js`).** Media
-Source Extensions let JavaScript feed media bytes to a
+**Outcome.** Tried and reverted. Did not help — the flash was
+still clearly visible and the staggering made the visual effect
+feel uneven rather than better. The fundamental issue (Safari
+re-fetching and re-parsing the moov atom on every `video.src`
+change) cannot be dodged by timing alone.
+
+### Approach #6: MSE via mp4box.js (shipped)
+
+Media Source Extensions let JavaScript feed media bytes to a
 `<video>` element via a `SourceBuffer` without a `src` change
 — the browser decodes appended chunks as one continuous stream,
 so segment boundaries become a `SourceBuffer.appendBuffer()`
-call with no `emptied` / `loadstart` cycle. **No flash at all**
-if it works.
+call with no `emptied` / `loadstart` cycle.
 
-The catch: MSE requires **fragmented MP4**, which is the one
-thing we can't change about the storage format (see "Why not
-HLS?"). The only way to keep the storage format as-is *and* use
-MSE is a JS-side transmuxer like [mux.js](https://github.com/videojs/mux.js)
-(maintained by the Video.js team, ~80 KB minified) that converts
-non-fragmented MP4 to fragmented MP4 in the browser. Fetch
-segment bytes → run through mux.js → append to SourceBuffer →
-play seamlessly.
+**The initial plan assumed mux.js** (TS→fMP4 transmuxer), but
+mux.js only accepts MPEG-TS input, not ISOBMFF. The actual
+implementation uses **[mp4box.js](https://github.com/gpac/mp4box.js)**
+(0.5.3, 156 KB minified), which parses non-fragmented MP4 and
+emits fragmented MP4 (init segment + moof/mdat chunks) suitable
+for MSE `SourceBuffer.appendBuffer()`.
 
-Risks:
+**Per-camera pipeline:**
 
-1. **Same contention problem**: Safari *might* serialize
-   `SourceBuffer.appendBuffer()` operations across multiple
-   elements the same way it serializes blob-URL ingestion.
-   Unknown until tested. If it does, MSE buys us nothing over
-   blob URLs.
-2. **Scrubbing compatibility**: the current setup uses native
-   `<video>` byte-range seeking. With MSE, the SourceBuffer is
-   the source of truth and JS has to manually append the right
-   bytes for a scrub target. Reimplementing scrub correctness
-   against MSE is not free.
-3. **Dependency and complexity**: ~80 KB of transmuxing JS,
-   plus the SourceBuffer state machine, plus replacing the
-   simple `video.src = url` pattern with a managed MSE pipeline
-   for all four cameras.
+```
+fetch(segmentUrl)
+  → arrayBuffer (full segment, ~12 MB)
+  → MP4Box.createFile() + appendBuffer + flush
+  → onReady: initializeSegmentation → init segments (ftyp+moov per track)
+  → onSegment: fragmented chunks (moof+mdat per track)
+  → SourceBuffer.appendBuffer(init), then appendBuffer(chunks)
+```
 
-MSE is the only remaining plausible path to *actual* zero-flash
-gapless playback in Safari without touching the recorder. It's
-also substantially more work than anything tried so far.
+Each camera has one `MediaSource` with separate video and audio
+`SourceBuffer`s, both in `mode='sequence'` (auto-advancing
+timestamps — eliminates gaps regardless of internal
+`baseMediaDecodeTime` values).
 
-**Approach #7: `<link rel="preload" as="video">`**. The spec-
-defined preload hint for `<video>`. Might populate a cache that
-Safari's `<video>` element actually consults (unlike `fetch()`
-blobs). Cheap to try, low confidence of working — Safari's
-handling of preload hints is historically inconsistent.
+**Risks from the plan vs actual outcome:**
+
+1. **Safari MSE contention** — did NOT materialize. Four
+   independent `MediaSource`/`SourceBuffer` sets work fine in
+   Safari 17+ on macOS. No serialization or decoder-budget
+   issues were observed, unlike the blob-URL path (approach #4).
+2. **Scrubbing** — required significant work. The `video.src`
+   approach got Safari's native byte-range seeking for free; MSE
+   requires JS to fetch the full segment, transmux, and append
+   before any frame appears. Scrub is noticeably slower than
+   pre-MSE (~300–500ms vs ~250ms) and required three follow-up
+   fixes: (a) deferring segment loads to mouseup during timeline
+   drags, (b) aborting stale fetches on rapid keyboard scrubs,
+   (c) freezing `wallTime` and pausing the video during loads to
+   prevent snap-back and fast-forward artifacts.
+3. **Complexity** — substantial. The playback layer grew from
+   ~80 lines (`loadSegmentForCamera` + `_seekVideo` +
+   `_onSegmentEnd`) to ~300 lines (MediaSource setup, mp4box
+   transmux, append loop with queue + abort, flush, seek, buffer
+   cleanup, MSE teardown for date changes). The `video.src = url`
+   pattern was simple; the MSE state machine is not.
+
+**Key implementation details:**
+
+- `mode='sequence'` was essential. The initial attempt used
+  `mode='segments'` with per-segment `timestampOffset`, which
+  broke because mp4box's fMP4 output has non-zero
+  `baseMediaDecodeTime` values. This caused gaps between
+  segments (stalls at boundaries) and misalignment between
+  `video.currentTime` and the anchor model (2-second seek
+  loops). Sequence mode auto-advances presentation timestamps
+  and eliminates these issues entirely.
+- Per-camera `AbortController` for fetch cancellation prevents
+  stale fetch pileup during rapid scrubs.
+- `videoLoading` flag gates both clock sync (prevents snap-back
+  to pre-scrub position) and drift correction (prevents seeking
+  non-primary cameras while they're loading).
+- Video is explicitly paused before a SourceBuffer flush to
+  prevent auto-play from position 0 when new data appears.
+- Init segments are appended once per SourceBuffer lifetime
+  (not per segment), on the assumption that codec parameters
+  are stable within a recording session (true for `-c copy`
+  from a stable go2rtc upstream). After a flush (scrub or date
+  change), init is re-appended.
+
+**Approach #7 (`<link rel="preload" as="video">`) was not
+tried** — MSE solved the gapless problem, making it moot.
 
 ### Diagnostic infrastructure
 
 `/api/debug/log` endpoints + `?debug=1` frontend instrumentation
-still live in the code for the next person to dig into this.
-Load the UI with `?debug=1`, exercise the flash, then:
+still live in the code. Load the UI with `?debug=1`, exercise a
+scenario, then:
 
 ```bash
 curl https://nvr.example.com/api/debug/log > /tmp/tinynvr-debug.log
@@ -663,36 +722,45 @@ kind, ev, file, ...}` per event. Instrumented events: every
 `loadedmetadata`, `loadeddata`, `canplay`, `canplaythrough`,
 `playing`, `waiting`, `stalled`, `seeking`, `seeked`, `error`,
 `ended`) plus every `loadSegmentForCamera` call (`kind: "load"`,
-`ev: "call"`). Zero cost when `?debug=1` is not on the URL.
-
-The first useful measurement is usually: for each transition,
-compute `playing_perfMs - loadstart_perfMs` per camera and look
-at the distribution across solo vs concurrent transitions. That's
-what told us the flash was network-dominated in HTTP mode and
-decoder-contention-dominated in blob-URL mode.
+`ev: "call"`) and MSE append errors (`ev: "append-error"`).
+Zero cost when `?debug=1` is not on the URL.
 
 ### Current assessment
 
-The 250ms concurrent flash appears to be the Safari floor for
-non-fragmented MP4 playback without rewriting the playback layer.
-Everything below that requires either (a) changing the storage
-format (rejected because it breaks scrubbing), (b) running bytes
-through a JS transmuxer to synthesize fragmented MP4 for MSE
-(approach #6, substantial work, unknown Safari behavior under
-concurrency), or (c) fighting Safari's quirks in ways that have
-so far made things worse.
+Segment-boundary playback is **gapless** via MSE + mp4box.js.
+The 250ms flash from the `video.src = url` era is gone. The
+trade-off is that scrubbing is slightly slower (full segment
+fetch + transmux + append vs Safari's native byte-range seek)
+and the playback layer is substantially more complex.
 
-If you're picking this up and the user is still annoyed by the
-flash, the honest prioritization is:
+**Known limitations of the MSE approach:**
 
-1. **Try approach #5 (staggered loads).** 10 lines of code. Low
-   risk. Might feel better, might feel worse.
-2. **Try approach #7 (`<link rel="preload" as="video">`).** Also
-   10 lines. Low confidence but cheap.
-3. **Try approach #6 (MSE + mux.js).** Substantial work, real
-   chance of a genuine fix, real chance of hitting the same
-   Safari concurrency ceiling. Decide whether the user cares
-   enough before committing to this.
+- **Scrub latency**: ~300–500ms to show a frame after a large
+  time jump (fetch + transmux + append), vs ~250ms with the old
+  `video.src` approach. Timeline drags defer loading to mouseup
+  to avoid storms, so the cursor moves smoothly but the video
+  frame only updates on release.
+- **Sequence-mode drift**: `mode='sequence'` auto-advances
+  timestamps, which means sub-second duration mismatches between
+  segments accumulate over time (~50ms/segment worst case, ~3s
+  after 1 hour). The primary-camera clock sync and the > 2s
+  drift correction on non-primary cameras bound this. A scrub
+  resets the anchor and eliminates accumulated drift.
+- **Full segment fetch**: the old approach let Safari fetch only
+  the moov atom + initial GOPs via byte-range requests (~300 KB
+  to start playing). MSE requires the full segment (~12 MB) to
+  transmux. This is fine on a LAN but would be a problem over a
+  slow link.
 
-Do not re-try double-buffering, HLS, HTTP-cache prefetch, or
-blob-URL prefetch without understanding why each failed above.
+**If scrub latency becomes intolerable**, the main avenue is
+incremental mp4box parsing: fetch just the moov (first ~50 KB,
+already at front thanks to `movflags=+faststart`), let mp4box
+parse it, then stream the mdat in chunks so the first GOP can
+be appended and displayed before the full segment is downloaded.
+mp4box.js supports incremental `appendBuffer` with `fileStart`
+offsets, but the integration is substantially more complex than
+the current whole-file approach.
+
+Do not re-try double-buffering (#2), HTTP-cache prefetch (#3),
+blob-URL prefetch (#4), or staggered loads (#5) without reading
+the failure details above.
