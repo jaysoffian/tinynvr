@@ -1402,6 +1402,13 @@ function nvr() {
 
       state.videoLoading = true;
 
+      // Pause the video before flushing so it doesn't auto-play from
+      // position 0 when new buffer data appears. Resume after seek.
+      if (this.playing) {
+        const v = this.getVideo(idx);
+        if (v && !v.paused) v.pause();
+      }
+
       // Cancel any in-flight fetch and clear stale queue entries so
       // rapid scrubs (keyboard or mouse) don't pile up.
       state.fetchAbort?.abort();
@@ -1466,7 +1473,7 @@ function nvr() {
             if (op.seekAfter) {
               this._seekVideoMSE(idx);
               const video = this.getVideo(idx);
-              if (video && this.playing && video.paused) {
+              if (video && this.playing) {
                 video.playbackRate = this.playbackSpeed;
                 video.play().catch(() => {});
               }
@@ -1779,10 +1786,16 @@ function nvr() {
             // video.currentTime is anchor-relative, so wallMs is just
             // anchor + currentTime.
             this.wallTime = new Date(s0.anchorMs + v0.currentTime * 1000);
-          } else {
-            // Video not usable — free-run the clock
+          } else if (!s0?.videoLoading) {
+            // Video not usable — free-run the clock. But NOT while a
+            // new segment is loading: free-running during a load causes
+            // wallTime to drift ahead of the scrub target, then the
+            // video "catches up" at apparent high speed once it loads.
             this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
           }
+          // When s0.videoLoading: wallTime stays frozen at the scrub
+          // target. Resumes when the load completes and clock syncs
+          // from the correctly positioned video.
 
           // Stop at end of recordings
           const latest = this._latestEnd();
