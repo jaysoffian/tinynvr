@@ -101,31 +101,71 @@ async function pickSegment() {
   throw new Error('no usable segment found');
 }
 
-function waitForCanPlay() {
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function waitForEvent(target, eventName, timeoutMs, label) {
   return new Promise((resolve, reject) => {
-    if (video.readyState >= 3) return resolve();
-    const onCan = () => { cleanup(); resolve(); };
-    const onErr = () => { cleanup(); reject(new Error('video error')); };
-    const cleanup = () => {
-      video.removeEventListener('canplay', onCan);
-      video.removeEventListener('error', onErr);
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      target.removeEventListener(eventName, onEvent);
+      target.removeEventListener('error', onErr);
+      if (err) reject(err); else resolve();
     };
-    video.addEventListener('canplay', onCan);
-    video.addEventListener('error', onErr);
+    const onEvent = () => finish();
+    const onErr = () => finish(new Error(`${label || eventName}: error code ${target.error?.code}`));
+    target.addEventListener(eventName, onEvent);
+    target.addEventListener('error', onErr);
+    const timer = setTimeout(() =>
+      finish(new Error(`${label || eventName} timeout (readyState=${target.readyState}, networkState=${target.networkState})`)),
+      timeoutMs);
   });
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function runRateTest(target) {
-  // Seek to a stable point away from the segment edges.
+async function loadSegment(url) {
+  // Attach src and explicitly kick off loading. Safari's preload=auto
+  // is best-effort; video.load() is load-bearing on WebKit to actually
+  // start the fetch for a freshly-assigned src.
+  video.src = url;
+  video.load();
+  if (video.readyState < 1) {
+    setStatus('Loading metadata…', 'pending');
+    await waitForEvent(video, 'loadedmetadata', 15000, 'loadedmetadata');
+  }
+  // Nudge playback to force buffering past metadata. Safari allows
+  // muted autoplay by policy, but if the browser is offered the video
+  // without play() it may stall at readyState 1 indefinitely.
+  setStatus('Starting buffer (muted autoplay)…', 'pending');
+  try {
+    await video.play();
+  } catch (e) {
+    throw new Error(`play() rejected: ${e.message}`);
+  }
+  // Wait for playback to actually advance past a frame so seeks work.
+  if (video.readyState < 2) {
+    await waitForEvent(video, 'loadeddata', 15000, 'loadeddata');
+  }
   video.pause();
-  video.currentTime = 1.0;
-  await sleep(100);
+}
+
+async function seekTo(t) {
+  if (Math.abs(video.currentTime - t) < 0.01) return;
+  video.currentTime = t;
+  await waitForEvent(video, 'seeked', 5000, `seek to ${t}`);
+}
+
+async function runRateTest(target, startTime) {
+  await seekTo(startTime);
   video.playbackRate = target;
   const startMedia = video.currentTime;
   const startWall = performance.now();
-  await video.play();
+  try {
+    await video.play();
+  } catch (e) {
+    throw new Error(`play() at rate ${target}: ${e.message}`);
+  }
   await sleep(RUN_SECONDS * 1000);
   video.pause();
   const dMedia = video.currentTime - startMedia;
@@ -149,12 +189,15 @@ async function main() {
     setStatus('Picking a segment…', 'pending');
     const { cam, date, seg } = await pickSegment();
     segEl.textContent = `${cam} / ${seg.filename} (${seg.duration_sec}s, ${date})`;
-    video.src = `/api/segments/${encodeURIComponent(cam)}/${encodeURIComponent(seg.filename)}`;
-    setStatus('Waiting for canplay…', 'pending');
-    await waitForCanPlay();
+    await loadSegment(`/api/segments/${encodeURIComponent(cam)}/${encodeURIComponent(seg.filename)}`);
+    // Interleave tests across the segment so each one has fresh buffer
+    // ahead of it instead of re-measuring the same 8s window.
+    let startTime = 1.0;
     for (const target of TESTS) {
-      setStatus(`Running ${target.toFixed(2)}× …`, 'pending');
-      await runRateTest(target);
+      setStatus(`Running ${target.toFixed(2)}× from ${startTime.toFixed(1)}s …`, 'pending');
+      await runRateTest(target, startTime);
+      startTime += RUN_SECONDS;
+      if (startTime + RUN_SECONDS + 1 > seg.duration_sec) startTime = 1.0;
     }
     const all = Array.from(resultsBody.querySelectorAll('tr'));
     const honored = all.filter(tr => tr.lastElementChild.textContent === 'yes').length;

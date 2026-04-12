@@ -881,6 +881,7 @@ function nvr() {
     unmutedIdx: null,
     scrubbing: false,
     _clockMasterIdx: null,  // camera whose video drives wallTime this tick; recomputed each tick with hysteresis
+    _testGap: null,      // [startMs, endMs] — ?test_gap=HH:MM:SS-HH:MM:SS dev hack to simulate an all-cameras-offline window
     _clockId: null,
     _refreshId: null,
     weekOffset: 0,
@@ -1064,6 +1065,19 @@ function nvr() {
       await this.fetchCameras();
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       await this.fetchAllSegments();
+      // Parse ?test_gap=HH:MM:SS-HH:MM:SS — dev hack to simulate an
+      // all-cameras-offline window on the currently selected day so
+      // the gap-skip path can be exercised without waiting for a
+      // real multi-camera outage.
+      const tgRaw = new URLSearchParams(location.search).get('test_gap');
+      if (tgRaw) {
+        const [fromStr, toStr] = tgRaw.split('-');
+        const fromMs = new Date(`${this.selectedDate}T${fromStr}`).getTime();
+        const toMs = new Date(`${this.selectedDate}T${toStr}`).getTime();
+        if (Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs > fromMs) {
+          this._testGap = [fromMs, toMs];
+        }
+      }
       this.loading = false;
       if (saved && saved.date === this.selectedDate) {
         this.wallTime = new Date(saved.wallTimeMs);
@@ -1275,6 +1289,7 @@ function nvr() {
       // Pick any camera currently rendering valid video. Hysteresis:
       // prefer the previous master if it still qualifies, so we don't
       // flap between cameras every frame when several are candidates.
+      if (this._inTestGap(this.wallTime.getTime())) return null;
       const prev = this._clockMasterIdx;
       if (prev != null && this._camIsMasterCandidate(prev)) return prev;
       for (let i = 0; i < this.cameras.length; i++) {
@@ -1283,11 +1298,19 @@ function nvr() {
       return null;
     },
 
+    _inTestGap(wallMs) {
+      // True iff the ?test_gap dev hack is active and wallMs falls
+      // inside the synthetic all-cameras-offline window.
+      const g = this._testGap;
+      return g != null && wallMs >= g[0] && wallMs < g[1];
+    },
+
     _anyCamHasFootageAt(wallMs) {
       // Segment-list query: does any camera have a recorded segment
       // covering this instant? Distinguishes a real multi-camera gap
       // (no footage exists) from a transient stall (footage exists,
       // the video element just isn't ready yet).
+      if (this._inTestGap(wallMs)) return false;
       const t = new Date(wallMs);
       for (const cam of this.cameras) {
         if (this.findSegmentAt(cam.name, t)) return true;
@@ -1299,13 +1322,17 @@ function nvr() {
       // Earliest segment start across all cameras strictly after
       // wallMs, or null if no more footage exists in the loaded set.
       // Used to jump the clock forward across a gap.
+      // When the ?test_gap dev hack is active, ignore any real
+      // segments that start inside the synthetic gap so we skip past
+      // it instead of landing in the middle.
+      const threshold = (this._testGap && wallMs < this._testGap[1]) ? this._testGap[1] : wallMs;
       let earliest = null;
       for (const cam of this.cameras) {
         const segs = this.segments[cam.name] || [];
         for (const seg of segs) {
           if (seg.duration_sec <= 0) continue;
           const start = this._parseStart(seg).getTime();
-          if (start > wallMs) {
+          if (start > threshold) {
             if (earliest == null || start < earliest) earliest = start;
             break;  // segments are sorted — first match is this cam's earliest
           }
