@@ -11,3 +11,4 @@ config.yaml
 recordings/
 tinynvr.tar
 static/alpine.min.js
+static/mp4box.all.min.js

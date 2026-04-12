@@ -864,6 +864,7 @@ html, body {
   </div>
 </div>
 
+<script defer src="mp4box.all.min.js"></script>
 <script defer src="alpine.min.js"></script>
 <script>
 function nvr() {
@@ -871,7 +872,7 @@ function nvr() {
     loading: true,
     cameras: [],
     segments: {},       // { cameraName: [segment, ...] }
-    camStates: {},      // { idx: { currentSegment, nextSegment, loadedSrc } }
+    camStates: {},      // { idx: { currentSegment, nextSegment, mediaSource, videoSB, audioSB, anchorMs, appendedFilenames, appendQueue, appending, ... } }
     selectedDate: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })(),
     wallTime: null,     // Date object: the playback position in absolute time
     playing: false,
@@ -1069,6 +1070,10 @@ function nvr() {
       this.loading = true;
       this.selectedDate = newDate;
       this.wallTime = new Date(newDate + 'T12:00:00');
+      // Tear down MediaSources before loading the new day so the first
+      // append lands on a fresh anchor instead of stitching across a
+      // many-hour gap.
+      this.cameras.forEach((_, idx) => this._resetCamMSE(idx));
       await this.fetchAllSegments();
       this.loading = false;
       this._pickInitialWallTime();
@@ -1081,7 +1086,7 @@ function nvr() {
         const res = await fetch('/api/cameras');
         this.cameras = await res.json();
         this.cameras.forEach((_, idx) => {
-          this.camStates[idx] = { currentSegment: null, nextSegment: null, loadedSrc: null, videoLoading: false };
+          this.camStates[idx] = this._freshCamState();
         });
       } catch (e) {
         console.error('Failed to fetch cameras:', e);
@@ -1309,13 +1314,34 @@ function nvr() {
       this.cameras.forEach((_, idx) => this.loadSegmentForCamera(idx));
     },
 
+    _freshCamState() {
+      return {
+        currentSegment: null,
+        nextSegment: null,
+        videoLoading: false,
+        mediaSource: null,
+        mediaSourceReady: null,  // Promise<void> resolving when MediaSource is 'open'
+        videoSB: null,
+        audioSB: null,
+        anchorMs: null,
+        appendedFilenames: new Set(),
+        appendQueue: [],
+        appending: false,
+        videoInitAppended: false,
+        audioInitAppended: false,
+        objectUrl: null,
+      };
+    },
+
     loadSegmentForCamera(idx) {
       const cam = this.cameras[idx];
       const video = this.getVideo(idx);
       if (!video || !cam) return;
 
-      const found = this.findSegmentAt(cam.name, this.wallTime);
       const state = this.camStates[idx];
+      if (!state) return;
+
+      const found = this.findSegmentAt(cam.name, this.wallTime);
 
       if (!found) {
         // During live playback, wallTime can briefly land in a gap
@@ -1326,99 +1352,363 @@ function nvr() {
         // clear when not playing — an explicit scrub into an empty
         // region, or a day switch, should actually blank out.
         if (this.playing) return;
-        if (state) {
-          state.currentSegment = null;
-          state.nextSegment = null;
-          state.loadedSrc = null;
-          state.videoLoading = false;
-        }
-        video.onloadedmetadata = null;
-        video.removeAttribute('src');
-        video.load();
+        state.currentSegment = null;
+        state.nextSegment = null;
+        state.videoLoading = false;
         return;
       }
 
       const seg = found.segment;
       const next = this.findNextSegment(cam.name, seg);
-      const url = this.segmentUrl(cam.name, seg);
       this._debug({
         kind: 'load', ev: 'call', cam: idx, file: seg.filename,
-        was: state?.loadedSrc ? state.loadedSrc.split('/').pop() : null,
       });
 
-      // Only reload video source if the segment actually changed
-      if (state && state.loadedSrc === url) {
-        state.currentSegment = seg;
-        state.nextSegment = next;
-        this._seekVideo(video, seg);
+      state.currentSegment = seg;
+      state.nextSegment = next;
+
+      // Lazy-initialize the MediaSource on first real load.
+      if (!state.mediaSource) {
+        this._initMediaSource(idx);
+      }
+
+      const segStartMs = this._parseStart(seg).getTime();
+
+      if (state.appendedFilenames.has(seg.filename)) {
+        // Segment already in buffer: just seek (if needed) and resume play.
+        this._seekVideoMSE(idx);
         if (this.playing && video.paused) {
           video.playbackRate = this.playbackSpeed;
           video.play().catch(() => {});
         }
+        // Opportunistic prefetch of the next segment.
+        this._enqueuePrefetch(idx, next);
         return;
       }
 
-      if (state) {
-        state.currentSegment = seg;
-        state.nextSegment = next;
-        state.loadedSrc = url;
-        state.videoLoading = true;
+      // Need to append this segment. Decide whether to flush first.
+      let needFlush = false;
+      if (state.anchorMs != null && state.videoSB && state.videoSB.buffered.length > 0) {
+        const buffEndWall = state.anchorMs + state.videoSB.buffered.end(0) * 1000;
+        const buffStartWall = state.anchorMs + state.videoSB.buffered.start(0) * 1000;
+        // "Far" = more than 2s outside the currently buffered wall range.
+        // Contiguous boundary transitions (prefetch not yet ready) land
+        // within 2s of buffEndWall and should append without flushing.
+        if (segStartMs > buffEndWall + 2000 || segStartMs + this._segmentDurationMs < buffStartWall - 2000) {
+          needFlush = true;
+        }
       }
 
-      video.src = url;
+      state.videoLoading = true;
 
-      // Use onX (not addEventListener) so that rapid segment changes
-      // replace the handler instead of accumulating stale listeners
-      video.onloadedmetadata = () => {
-        video.onloadedmetadata = null;
-        if (state) state.videoLoading = false;
-        video.muted = this.unmutedIdx !== idx;
-        this._seekVideo(video, seg);
-        if (this.playing) {
-          video.playbackRate = this.playbackSpeed;
-          video.play().catch(() => {});
-        }
-      };
+      if (needFlush) {
+        state.appendQueue.push({ type: 'flush' });
+      }
+      state.appendQueue.push({ type: 'append', segment: seg, forIdx: idx, seekAfter: true });
+      this._runAppendLoop(idx);
 
-      video.onerror = () => {
-        video.onerror = null;
-        if (state) state.videoLoading = false;
-        // Segment failed to load (corrupt file, 500, etc.) — skip it
-        this._onSegmentEnd(idx);
-      };
-
-      video.onended = () => this._onSegmentEnd(idx);
+      // Prefetch next segment too.
+      this._enqueuePrefetch(idx, next);
     },
 
-    _seekVideo(video, seg) {
-      if (!video || !seg || !this.wallTime) return;
-      const segStart = this._parseStart(seg).getTime();
-      const offset = (this.wallTime.getTime() - segStart) / 1000;
-      const dur = isNaN(video.duration) ? (seg.duration_sec || this._segmentDurationMs / 1000) : video.duration;
-      const target = Math.max(0, Math.min(offset, dur));
+    _enqueuePrefetch(idx, seg) {
+      if (!seg) return;
+      const state = this.camStates[idx];
+      if (!state) return;
+      if (state.appendedFilenames.has(seg.filename)) return;
+      if (state.appendQueue.some(op => op.type === 'append' && op.segment.filename === seg.filename)) return;
+      state.appendQueue.push({ type: 'append', segment: seg, forIdx: idx, seekAfter: false });
+      this._runAppendLoop(idx);
+    },
+
+    _initMediaSource(idx) {
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state || !video) return;
+      const ms = new MediaSource();
+      state.mediaSource = ms;
+      state.objectUrl = URL.createObjectURL(ms);
+      state.mediaSourceReady = new Promise((resolve, reject) => {
+        ms.addEventListener('sourceopen', () => resolve(), { once: true });
+        ms.addEventListener('error', () => reject(new Error('MediaSource error')), { once: true });
+      });
+      video.src = state.objectUrl;
+      video.muted = this.unmutedIdx !== idx;
+    },
+
+    async _runAppendLoop(idx) {
+      const state = this.camStates[idx];
+      if (!state || state.appending) return;
+      state.appending = true;
+      try {
+        await state.mediaSourceReady;
+        while (state.appendQueue.length > 0) {
+          const op = state.appendQueue.shift();
+          if (op.type === 'flush') {
+            await this._flushSourceBuffers(state);
+            continue;
+          }
+          // op.type === 'append'
+          try {
+            const bytes = await this._fetchSegmentBytes(idx, op.segment);
+            const tm = await this._transmuxSegment(bytes);
+            await this._appendToSourceBuffers(state, op.segment, tm);
+            state.appendedFilenames.add(op.segment.filename);
+            if (op.seekAfter) {
+              this._seekVideoMSE(idx);
+              const video = this.getVideo(idx);
+              if (video && this.playing && video.paused) {
+                video.playbackRate = this.playbackSpeed;
+                video.play().catch(() => {});
+              }
+              state.videoLoading = false;
+            }
+            this._maybeBufferCleanup(state);
+          } catch (e) {
+            state.videoLoading = false;
+            this._debug({
+              kind: 'load', ev: 'append-error', cam: idx,
+              file: op.segment.filename, err: String(e && e.message || e),
+            });
+            // Drop this segment and keep going. The clock tick will
+            // eventually advance wallTime past it and ask for the next.
+          }
+        }
+      } finally {
+        state.appending = false;
+      }
+    },
+
+    async _fetchSegmentBytes(idx, seg) {
+      const cam = this.cameras[idx];
+      const url = this.segmentUrl(cam.name, seg);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('fetch ' + res.status);
+      return await res.arrayBuffer();
+    },
+
+    _transmuxSegment(arrayBuffer) {
+      return new Promise((resolve, reject) => {
+        if (typeof MP4Box === 'undefined') {
+          reject(new Error('MP4Box global not available'));
+          return;
+        }
+        const file = MP4Box.createFile();
+        const out = {
+          videoTrackId: null,
+          audioTrackId: null,
+          videoCodec: null,
+          audioCodec: null,
+          videoInit: null,
+          audioInit: null,
+          videoChunks: [],
+          audioChunks: [],
+        };
+        let readyFired = false;
+        file.onError = (e) => reject(new Error('mp4box parse: ' + e));
+        file.onReady = (info) => {
+          readyFired = true;
+          for (const t of info.tracks) {
+            if (t.video && out.videoTrackId == null) {
+              out.videoTrackId = t.id;
+              out.videoCodec = t.codec;
+            } else if (t.audio && out.audioTrackId == null) {
+              out.audioTrackId = t.id;
+              out.audioCodec = t.codec;
+            }
+          }
+          for (const t of info.tracks) {
+            if (t.id === out.videoTrackId || t.id === out.audioTrackId) {
+              file.setSegmentOptions(t.id, null, { nbSamples: 100000 });
+            }
+          }
+          const inits = file.initializeSegmentation();
+          for (const init of inits) {
+            if (init.id === out.videoTrackId) out.videoInit = init.buffer;
+            else if (init.id === out.audioTrackId) out.audioInit = init.buffer;
+          }
+          file.start();
+        };
+        file.onSegment = (id, _user, buffer, _sampleNumber, _last) => {
+          if (id === out.videoTrackId) out.videoChunks.push(buffer);
+          else if (id === out.audioTrackId) out.audioChunks.push(buffer);
+        };
+        try {
+          const buf = arrayBuffer;
+          buf.fileStart = 0;
+          file.appendBuffer(buf);
+          file.flush();
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        if (!readyFired) {
+          reject(new Error('mp4box: onReady never fired'));
+          return;
+        }
+        if (!out.videoInit && !out.audioInit) {
+          reject(new Error('mp4box: no tracks extracted'));
+          return;
+        }
+        resolve(out);
+      });
+    },
+
+    async _appendToSourceBuffers(state, seg, tm) {
+      const ms = state.mediaSource;
+      if (!ms || ms.readyState !== 'open') {
+        throw new Error('MediaSource not open');
+      }
+      // Create SourceBuffers on first append.
+      if (!state.videoSB && tm.videoInit && tm.videoCodec) {
+        const type = `video/mp4; codecs="${tm.videoCodec}"`;
+        if (!MediaSource.isTypeSupported(type)) {
+          throw new Error('unsupported video codec ' + type);
+        }
+        state.videoSB = ms.addSourceBuffer(type);
+        state.videoSB.mode = 'segments';
+      }
+      if (!state.audioSB && tm.audioInit && tm.audioCodec) {
+        const type = `audio/mp4; codecs="${tm.audioCodec}"`;
+        if (MediaSource.isTypeSupported(type)) {
+          state.audioSB = ms.addSourceBuffer(type);
+          state.audioSB.mode = 'segments';
+        }
+        // If audio codec is unsupported, silently fall through —
+        // video-only playback is acceptable.
+      }
+
+      // Anchor on first successful append.
+      if (state.anchorMs == null) {
+        state.anchorMs = this._parseStart(seg).getTime();
+      }
+      const offsetSec = (this._parseStart(seg).getTime() - state.anchorMs) / 1000;
+
+      if (state.videoSB) {
+        if (!state.videoInitAppended && tm.videoInit) {
+          await this._appendBytes(state.videoSB, tm.videoInit);
+          state.videoInitAppended = true;
+        }
+        state.videoSB.timestampOffset = offsetSec;
+        for (const chunk of tm.videoChunks) {
+          await this._appendBytes(state.videoSB, chunk);
+        }
+      }
+      if (state.audioSB) {
+        if (!state.audioInitAppended && tm.audioInit) {
+          await this._appendBytes(state.audioSB, tm.audioInit);
+          state.audioInitAppended = true;
+        }
+        state.audioSB.timestampOffset = offsetSec;
+        for (const chunk of tm.audioChunks) {
+          await this._appendBytes(state.audioSB, chunk);
+        }
+      }
+    },
+
+    _appendBytes(sb, bytes) {
+      return new Promise((resolve, reject) => {
+        const onEnd = () => { cleanup(); resolve(); };
+        const onErr = () => { cleanup(); reject(new Error('SourceBuffer append error')); };
+        const cleanup = () => {
+          sb.removeEventListener('updateend', onEnd);
+          sb.removeEventListener('error', onErr);
+        };
+        sb.addEventListener('updateend', onEnd);
+        sb.addEventListener('error', onErr);
+        try {
+          sb.appendBuffer(bytes);
+        } catch (e) {
+          cleanup();
+          reject(e);
+        }
+      });
+    },
+
+    async _flushSourceBuffers(state) {
+      const sbs = [state.videoSB, state.audioSB].filter(Boolean);
+      for (const sb of sbs) {
+        try {
+          if (sb.updating) sb.abort();
+        } catch (e) {}
+      }
+      for (const sb of sbs) {
+        if (sb.buffered.length === 0) continue;
+        await new Promise((resolve) => {
+          const onEnd = () => { sb.removeEventListener('updateend', onEnd); resolve(); };
+          sb.addEventListener('updateend', onEnd);
+          try {
+            sb.remove(0, Infinity);
+          } catch (e) {
+            sb.removeEventListener('updateend', onEnd);
+            resolve();
+          }
+        });
+      }
+      state.appendedFilenames = new Set();
+      state.anchorMs = null;
+    },
+
+    _seekVideoMSE(idx) {
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state || !video || state.anchorMs == null || !this.wallTime) return;
+      const target = (this.wallTime.getTime() - state.anchorMs) / 1000;
+      if (!Number.isFinite(target) || target < 0) return;
       if (Math.abs(video.currentTime - target) > 0.5) {
         video.currentTime = target;
       }
     },
 
-    _onSegmentEnd(idx) {
-      const state = this.camStates[idx];
-      if (!state) return;
-
-      if (idx === 0) {
-        // Jump wallTime forward to next segment if needed, but NEVER backward.
-        // A backward jump here is what caused the seek snap-back: short/corrupt
-        // segments end before wallTime, and the next segment starts earlier
-        // than where we seeked to.
-        if (state.nextSegment) {
-          const nextStart = this._parseStart(state.nextSegment);
-          if (nextStart > this.wallTime) {
-            this.wallTime = nextStart;
-          }
+    _maybeBufferCleanup(state) {
+      // Trim old buffered data lazily to keep memory bounded. Best-effort.
+      // Runs from the append loop after a successful append; both SBs
+      // are idle at that point.
+      const idx = Object.keys(this.camStates).find(k => this.camStates[k] === state);
+      if (idx == null) return;
+      const videoEl = this.getVideo(Number(idx));
+      if (!videoEl) return;
+      const ct = videoEl.currentTime;
+      const sbs = [state.videoSB, state.audioSB].filter(Boolean);
+      for (const sb of sbs) {
+        if (sb.updating) continue;
+        if (sb.buffered.length === 0) continue;
+        const end = sb.buffered.end(0);
+        const start = sb.buffered.start(0);
+        if (end - start > 300 && ct - start > 90) {
+          try { sb.remove(start, ct - 60); } catch (e) {}
         }
-        this.loadSegmentsForAll();
-      } else {
-        this.loadSegmentForCamera(idx);
+      }
+    },
+
+    _resetCamMSE(idx) {
+      // Tear down the MediaSource for this camera. Called on changeDate
+      // so the new day starts fresh without stitching across a huge
+      // anchor gap.
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state) return;
+      state.appendQueue = [];
+      state.appending = false;
+      state.appendedFilenames = new Set();
+      state.anchorMs = null;
+      state.videoInitAppended = false;
+      state.audioInitAppended = false;
+      state.videoSB = null;
+      state.audioSB = null;
+      state.currentSegment = null;
+      state.nextSegment = null;
+      state.videoLoading = false;
+      if (state.objectUrl) {
+        try { URL.revokeObjectURL(state.objectUrl); } catch (e) {}
+        state.objectUrl = null;
+      }
+      state.mediaSource = null;
+      state.mediaSourceReady = null;
+      if (video) {
+        try { video.pause(); } catch (e) {}
+        video.removeAttribute('src');
+        try { video.load(); } catch (e) {}
       }
     },
 
@@ -1466,10 +1756,11 @@ function nvr() {
           const v0 = this.getVideo(0);
           const s0 = this.camStates[0];
 
-          if (v0 && s0?.currentSegment && !v0.paused && !v0.seeking && v0.readyState >= 2) {
-            // Sync clock from primary video to prevent drift
-            const segStart = this._parseStart(s0.currentSegment).getTime();
-            this.wallTime = new Date(segStart + v0.currentTime * 1000);
+          if (v0 && s0?.currentSegment && s0.anchorMs != null && !v0.paused && !v0.seeking && v0.readyState >= 2) {
+            // Sync clock from primary video to prevent drift. With MSE,
+            // video.currentTime is anchor-relative, so wallMs is just
+            // anchor + currentTime.
+            this.wallTime = new Date(s0.anchorMs + v0.currentTime * 1000);
           } else {
             // Video not usable — free-run the clock
             this.wallTime = new Date(this.wallTime.getTime() + dt * this.playbackSpeed * 1000);
@@ -1501,12 +1792,14 @@ function nvr() {
             const wt = this.wallTime.getTime();
             if (wt >= segEnd || wt < segStart) {
               this.loadSegmentForCamera(i);
-            } else if (i > 0) {
-              // Keep non-primary cameras in sync (only seek if drift > 2s)
+            } else if (i > 0 && state.anchorMs != null) {
+              // Keep non-primary cameras in sync (only seek if drift > 2s).
+              // With MSE, video.currentTime is anchor-relative.
               const video = this.getVideo(i);
               if (video && !video.seeking && video.readyState >= 2) {
-                const offset = (wt - segStart) / 1000;
-                if (Math.abs(video.currentTime - offset) > 2) {
+                const offset = (wt - state.anchorMs) / 1000;
+                if (Number.isFinite(offset) && offset >= 0 &&
+                    Math.abs(video.currentTime - offset) > 2) {
                   video.currentTime = offset;
                 }
               }
