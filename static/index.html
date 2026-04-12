@@ -1004,6 +1004,10 @@ function nvr() {
           this._debugBuffer = [];
         });
       }
+      // Restore saved position before fetching so the week picker
+      // and segment fetch use the correct date.
+      const saved = this._restorePosition();
+      if (saved) this.selectedDate = saved.date;
       try {
         const [rangeRes, versionRes] = await Promise.all([
           fetch('/api/recordings/range'),
@@ -1023,9 +1027,14 @@ function nvr() {
       this.wallTime = new Date(this.selectedDate + 'T12:00:00');
       await this.fetchAllSegments();
       this.loading = false;
-      this._pickInitialWallTime();
+      if (saved && saved.date === this.selectedDate) {
+        this.wallTime = new Date(saved.wallTimeMs);
+      } else {
+        this._pickInitialWallTime();
+      }
       this.loadSegmentsForAll();
       this._startSegmentRefresh();
+      this._startPositionSave();
     },
 
     _isToday() {
@@ -2081,6 +2090,39 @@ function nvr() {
       // Normal click: clear selection and scrub
       this.clearSelection();
       this.startScrub(e);
+    },
+
+    // -- Position persistence --
+
+    _startPositionSave() {
+      setInterval(() => this._savePosition(), 5000);
+      window.addEventListener('pagehide', () => this._savePosition());
+    },
+
+    _savePosition() {
+      if (!this.wallTime) return;
+      try {
+        sessionStorage.setItem('tinynvr_pos', JSON.stringify({
+          date: this.selectedDate,
+          wallTimeMs: this.wallTime.getTime(),
+        }));
+      } catch (e) {}
+    },
+
+    _restorePosition() {
+      try {
+        const raw = sessionStorage.getItem('tinynvr_pos');
+        if (!raw) return null;
+        const saved = JSON.parse(raw);
+        if (!saved.date || !saved.wallTimeMs) return null;
+        // Don't restore a future date.
+        const now = new Date();
+        const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+        if (saved.date > today) return null;
+        return saved;
+      } catch (e) {
+        return null;
+      }
     },
 
     clearSelection() {
