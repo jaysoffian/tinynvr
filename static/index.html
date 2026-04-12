@@ -1123,7 +1123,6 @@ function nvr() {
 
     async changeDate(newDate) {
       this.pause();
-      this.clearSelection();
       this.loading = true;
       this.selectedDate = newDate;
       this.wallTime = new Date(newDate + 'T12:00:00');
@@ -2117,13 +2116,7 @@ function nvr() {
       if (e.shiftKey) {
         const clickedTime = this._fsTimeFromEvent(point);
         if (!clickedTime) return;
-        if (this.wallTime < clickedTime) {
-          this.selectionStart = new Date(this.wallTime);
-          this.selectionEnd = clickedTime;
-        } else {
-          this.selectionStart = clickedTime;
-          this.selectionEnd = new Date(this.wallTime);
-        }
+        this._extendOrCreateSelection(clickedTime);
         return;
       }
       this.clearSelection();
@@ -2177,14 +2170,7 @@ function nvr() {
       if (e.shiftKey) {
         const clickedTime = this._timeFromOverlayEvent(point);
         if (!clickedTime) return;
-        // Set range from current wallTime to shift-clicked point
-        if (this.wallTime < clickedTime) {
-          this.selectionStart = new Date(this.wallTime);
-          this.selectionEnd = clickedTime;
-        } else {
-          this.selectionStart = clickedTime;
-          this.selectionEnd = new Date(this.wallTime);
-        }
+        this._extendOrCreateSelection(clickedTime);
         return;
       }
       // Normal click: clear selection and scrub
@@ -2225,6 +2211,33 @@ function nvr() {
       }
     },
 
+    _extendOrCreateSelection(clickedTime) {
+      if (this.selectionStart && this.selectionEnd) {
+        // Extend existing selection to include the clicked point.
+        // Adjust whichever endpoint is closer to the click.
+        const distToStart = Math.abs(clickedTime - this.selectionStart);
+        const distToEnd = Math.abs(clickedTime - this.selectionEnd);
+        if (distToStart < distToEnd) {
+          this.selectionStart = clickedTime;
+        } else {
+          this.selectionEnd = clickedTime;
+        }
+        // Keep start <= end
+        if (this.selectionStart > this.selectionEnd) {
+          [this.selectionStart, this.selectionEnd] = [this.selectionEnd, this.selectionStart];
+        }
+      } else {
+        // Create new selection from wallTime to clicked point.
+        if (this.wallTime < clickedTime) {
+          this.selectionStart = new Date(this.wallTime);
+          this.selectionEnd = clickedTime;
+        } else {
+          this.selectionStart = clickedTime;
+          this.selectionEnd = new Date(this.wallTime);
+        }
+      }
+    },
+
     clearSelection() {
       this.selectionStart = null;
       this.selectionEnd = null;
@@ -2238,14 +2251,22 @@ function nvr() {
       const endPct = (this.selectionEnd - sod) / dayLen * 100;
       const left = Math.max(0, Math.min(100, startPct));
       const right = Math.max(0, Math.min(100, endPct));
+      if (right <= left) return 'display:none';
       return `left:${left}%;width:${right - left}%`;
     },
 
     selectionRangeDisplay() {
       if (!this.selectionStart || !this.selectionEnd) return '';
-      const fmt = d => [d.getHours(), d.getMinutes(), d.getSeconds()]
+      const timeFmt = d => [d.getHours(), d.getMinutes(), d.getSeconds()]
         .map(n => String(n).padStart(2, '0')).join(':');
-      return fmt(this.selectionStart) + ' \u2013 ' + fmt(this.selectionEnd);
+      const sameDay = this.selectionStart.getFullYear() === this.selectionEnd.getFullYear()
+        && this.selectionStart.getMonth() === this.selectionEnd.getMonth()
+        && this.selectionStart.getDate() === this.selectionEnd.getDate();
+      if (sameDay) {
+        return timeFmt(this.selectionStart) + ' \u2013 ' + timeFmt(this.selectionEnd);
+      }
+      const dateFmt = d => `${d.getMonth()+1}/${d.getDate()} ${timeFmt(d)}`;
+      return dateFmt(this.selectionStart) + ' \u2013 ' + dateFmt(this.selectionEnd);
     },
 
     rangeDownloadUrl(camName) {
