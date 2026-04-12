@@ -676,7 +676,7 @@ html, body {
           </svg>
         </button>
         <div class="panel-actions" x-show="camStates[idx]?.currentSegment" x-cloak>
-          <a :href="downloadUrl(idx)" download @click.stop title="Download segment">
+          <a :href="downloadUrl(idx)" :download="downloadFilename(idx)" @click.stop title="Download segment">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
               <polyline points="7 10 12 15 17 10"/>
@@ -735,7 +735,7 @@ html, body {
                   <span x-show="downloadingCam === cam.name" style="font-size:11px;" x-text="downloadPercent != null ? downloadPercent + '%' : '...'"></span>
                 </button>
                 <a class="fs-download" x-show="!selectionStart && camStates[idx]?.currentSegment"
-                   :href="downloadUrl(idx)" download @click.stop title="Download segment">
+                   :href="downloadUrl(idx)" :download="downloadFilename(idx)" @click.stop title="Download segment">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                     <polyline points="7 10 12 15 17 10"/>
@@ -1287,7 +1287,18 @@ function nvr() {
       const cam = this.cameras[idx];
       const state = this.camStates[idx];
       if (!cam || !state?.currentSegment) return '#';
-      return this.segmentUrl(cam.name, state.currentSegment) + '?download=1';
+      return this.segmentUrl(cam.name, state.currentSegment);
+    },
+
+    downloadFilename(idx) {
+      const cam = this.cameras[idx];
+      const state = this.camStates[idx];
+      if (!cam || !state?.currentSegment) return '';
+      // Prefix the camera name so downloads land with a useful
+      // filename; without this, Safari saves them as just the
+      // recorder's bare timestamp (2026-04-11_21-04-00.mp4) which is
+      // ambiguous when you download from multiple cameras.
+      return `${cam.name}_${state.currentSegment.filename}`;
     },
 
     getVideo(idx) {
@@ -1295,7 +1306,21 @@ function nvr() {
     },
 
     loadSegmentsForAll() {
-      this.cameras.forEach((_, idx) => this.loadSegmentForCamera(idx));
+      // Stagger by 100ms per camera index. When two cameras share an
+      // ffmpeg rotation boundary and both need to load at the same
+      // instant, Safari's media pipeline contends — concurrent loads
+      // take ~3x as long as solo loads (measured in debug logs).
+      // Offsetting the loads spreads the per-camera flash over a
+      // longer window instead of stacking them on top of each other.
+      // Cam 0 runs synchronously so the primary clock source stays
+      // tight; others are deferred.
+      this.cameras.forEach((_, idx) => {
+        if (idx === 0) {
+          this.loadSegmentForCamera(idx);
+        } else {
+          setTimeout(() => this.loadSegmentForCamera(idx), idx * 100);
+        }
+      });
     },
 
     loadSegmentForCamera(idx) {
