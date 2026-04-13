@@ -84,7 +84,7 @@ ffmpeg -rtsp_transport tcp -timeout 30000000 -i <rtsp> \
 - **`+faststart`** moves the `moov` atom to the front of each segment
   on clean close, so Safari can start playing immediately without
   seeking to the end of the file to find metadata.
-- **Segment length is fixed at 60 seconds** via `SEGMENT_SECONDS` in
+- **Segment length is fixed at 60 seconds** via `_SEGMENT_SECONDS` in
   `recorder.py` and is intentionally not configurable. Two things
   scale with segment length, and both favor short segments:
   - **Playback latency to "live"**: a segment isn't playable until
@@ -308,7 +308,7 @@ cameras:
 `segment_minutes` used to be configurable (1–60) but is now fixed
 at 1 minute in `recorder.py` — see the Recording section above. The `.venv`,
 the recorder, the frontend fallback, and the retention math all
-share that assumption via `SEGMENT_SECONDS` on the backend and
+share that assumption via `_SEGMENT_SECONDS` on the backend and
 `_segmentDurationMs = 60000` on the frontend.
 
 ## Why not HLS?

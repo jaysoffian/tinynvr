@@ -8,6 +8,7 @@ import signal
 import time
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 
 from asyncinotify import Inotify, Mask
@@ -18,7 +19,8 @@ from tinynvr.probe import probe_duration, unlink_unplayable
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_SECONDS = 60
+_SEGMENT_SECONDS = 60
+_probe_duration = partial(probe_duration, max_duration=_SEGMENT_SECONDS * 1.5)
 
 
 class CameraState(StrEnum):
@@ -193,7 +195,7 @@ class CameraRecorder:
             "-reset_timestamps",
             "1",
             "-segment_time",
-            str(SEGMENT_SECONDS),
+            str(_SEGMENT_SECONDS),
             "-segment_format",
             "mp4",
             "-segment_format_options",
@@ -276,7 +278,7 @@ class CameraRecorder:
         event fires for a ``.mp4`` under this camera's tree.
         """
         try:
-            dur = await probe_duration(segment)
+            dur = await _probe_duration(segment)
             if dur is None:
                 unlink_unplayable(segment)
                 return
@@ -334,7 +336,7 @@ class CameraRecorder:
 
         async def _probe_one(p: Path, start_utc: int) -> None:
             async with sem:
-                dur = await probe_duration(p)
+                dur = await _probe_duration(p)
                 if dur is None:
                     unlink_unplayable(p)
                     return

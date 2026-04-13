@@ -7,10 +7,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_MAX_DURATION = 3600.0  # 1 hour sanity cap
 
-
-async def probe_duration(segment: Path) -> float | None:
+async def probe_duration(segment: Path, max_duration: float) -> float | None:
     """Probe a single file with ffprobe. Returns ``None`` on failure."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -31,7 +29,7 @@ async def probe_duration(segment: Path) -> float | None:
         raw = info.get("format", {}).get("duration")
         if raw is None:
             return None
-        dur = min(float(raw), _MAX_DURATION)
+        dur = min(float(raw), max_duration)
         logger.debug("ffprobe %s: %.3fs", segment, dur)
     except (ValueError, OSError) as exc:
         logger.warning("ffprobe errored for %s: %s", segment, exc)

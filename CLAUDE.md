@@ -30,7 +30,7 @@ a "Why not HLS?" rationale.
   scrubbing. Do not switch to fragmented MP4, HLS, or MSE — see
   [DESIGN.md](DESIGN.md) "Why not HLS?" for the full rationale and
   the specific regressions that killed the HLS branch.
-- `SEGMENT_SECONDS` is fixed at 60 and intentionally not
+- `_SEGMENT_SECONDS` is fixed at 60 and intentionally not
   configurable — see README.md "Why 1-minute segments".
 - Playback uses a single `<video>` element per camera. A
   double-buffered swap was explored and reverted because it broke
