@@ -36,3 +36,11 @@ rev = "v1.1.408"
 hooks = [
   { id = "pyright" }
 ]
+
+[[repos]]
+repo = "https://github.com/AleksaC/hadolint-py"
+rev = "v2.14.0"
+hooks = [
+  # DL3018: pinning apk versions is moot under `FROM alpine:edge`.
+  { id = "hadolint", args = ["--ignore", "DL3018"] }
+]
