@@ -1,0 +1,1710 @@
+function nvr() {
+  return {
+    loading: true,
+    cameras: [],
+    segments: {}, // { cameraName: [segment, ...] }
+    camStates: {}, // { idx: { currentSegment, nextSegment, mediaSource, videoSB, audioSB, anchorMs, appendedFilenames, appendQueue, appending, ... } }
+    selectedDate: (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    })(),
+    wallTime: null, // Date object: the playback position in absolute time
+    playing: false,
+    playbackSpeed: 1,
+    fullscreenIdx: null,
+    unmutedIdx: null,
+    scrubbing: false,
+    _clockMasterIdx: null, // camera whose video drives wallTime this tick; recomputed each tick with hysteresis
+    _testGap: null, // [startMs, endMs] — ?test_gap=HH:MM:SS-HH:MM:SS dev hack to simulate an all-cameras-offline window
+    _clockId: null,
+    _refreshId: null,
+    weekOffset: 0,
+    weekDays: [],
+    earliestDate: null,
+    version: "",
+    canGoBack: true,
+    canGoForward: false,
+    hoverPct: null, // 0-100 timeline position during hover, null when not hovering
+    hoverTime: null, // Date at hover position
+
+    // Opt-in debug instrumentation; enabled with ?debug=1 on the URL.
+    // Captures video element events + load calls
+    // and POSTs them to /api/debug/log in small batches. Enable in
+    // the browser, exercise the bug, curl GET /api/debug/log to pull
+    // the file back. No cost when disabled.
+    _debugEnabled:
+      typeof location !== "undefined" && new URLSearchParams(location.search).has("debug"),
+    _debugBuffer: [],
+    _debugFlushTimer: null,
+    selectionStart: null, // Date object
+    selectionEnd: null, // Date object
+    downloadingCam: null, // camera name currently downloading, or null
+    downloadPercent: null, // 0-100 or null
+
+    get currentTimeDisplay() {
+      if (!this.wallTime) return "--:--:--";
+      const d = this.wallTime;
+      return [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map((n) => String(n).padStart(2, "0"))
+        .join(":");
+    },
+
+    get currentDateDisplay() {
+      if (!this.wallTime) return "";
+      return this.wallTime.toLocaleDateString(undefined, {
+        weekday: "long",
+        month: "long",
+        day: "numeric",
+      });
+    },
+
+    get cursorPercent() {
+      if (!this.wallTime) return 0;
+      const sod = this._startOfDay().getTime();
+      return Math.max(
+        0,
+        Math.min(100, ((this.wallTime.getTime() - sod) / this._dayLengthMs()) * 100),
+      );
+    },
+
+    _startOfDay() {
+      return new Date(this.selectedDate + "T00:00:00");
+    },
+
+    // Local midnight of the day after selectedDate. Uses the Date
+    // constructor (not ISO parsing) so DST offsets resolve from the
+    // browser's tz database — spring-ahead days are 23h, fall-back 25h.
+    _nextStartOfDay() {
+      const [y, m, d] = this.selectedDate.split("-").map(Number);
+      return new Date(y, m - 1, d + 1);
+    },
+
+    _dayLengthMs() {
+      return this._nextStartOfDay().getTime() - this._startOfDay().getTime();
+    },
+
+    _formatDateStr(d) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    },
+
+    _checkDateCrossing() {
+      if (!this.wallTime) return;
+      const wt = this.wallTime.getTime();
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
+      if (wt >= dayStart && wt < dayEnd) return;
+      // wallTime has left the selected day — compute the correct date.
+      const d = new Date(wt);
+      this._switchDisplayDate(this._formatDateStr(d));
+    },
+
+    _switchDisplayDate(newDateStr) {
+      if (newDateStr === this.selectedDate) return;
+      // Don't navigate into the future or before earliest recordings.
+      const today = this._formatDateStr(new Date());
+      if (newDateStr > today) return;
+      if (this.earliestDate && newDateStr < this.earliestDate) return;
+
+      this.selectedDate = newDateStr;
+      // Set weekOffset so the trailing 7-day window includes newDate.
+      // weekOffset 0 = window ends at today; each decrement shifts 7 days back.
+      const todayDate = new Date();
+      todayDate.setHours(0, 0, 0, 0);
+      const [y, m, d] = newDateStr.split("-").map(Number);
+      const newDate = new Date(y, m - 1, d);
+      const daysBack = Math.round((todayDate - newDate) / 86400000);
+      this.weekOffset = -Math.floor(daysBack / 7);
+      this.buildWeek();
+      this._startSegmentRefresh();
+      // Re-fetch segments around the new center date. Non-blocking;
+      // the merge logic preserves object identity so playback continues.
+      this.fetchAllSegments();
+    },
+
+    // One tick per real-time hour from local midnight to next local
+    // midnight, labeled with the local clock hour at that instant.
+    // Normal days produce 24 ticks 00..23; spring-ahead produces 23
+    // ticks with one local hour absent; fall-back produces 25 ticks
+    // with one local hour repeated. No DST rules hardcoded — the
+    // labels come from Date.getHours() which resolves via the IANA
+    // tz database.
+    get hourTicks() {
+      const sod = this._startOfDay().getTime();
+      const dayLen = this._dayLengthMs();
+      const ticks = [];
+      for (let ms = 0; ms < dayLen; ms += 3600000) {
+        const d = new Date(sod + ms);
+        ticks.push({
+          label: String(d.getHours()).padStart(2, "0"),
+          leftPct: (ms / dayLen) * 100,
+        });
+      }
+      return ticks;
+    },
+
+    buildWeek() {
+      const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      // Trailing 7-day window: rightmost day is today + weekOffset * 7,
+      // capped at today so future days are never shown.
+      const endDay = new Date(today);
+      endDay.setDate(endDay.getDate() + this.weekOffset * 7);
+      if (endDay > today) endDay.setTime(today.getTime());
+      const days = [];
+      for (let i = -6; i <= 0; i++) {
+        const d = new Date(endDay);
+        d.setDate(d.getDate() + i);
+        const iso = this._formatDateStr(d);
+        days.push({
+          iso,
+          label: DAY_LABELS[d.getDay()],
+          num: d.getDate(),
+          isToday: d.getTime() === today.getTime(),
+          isFuture: false,
+          beforeEarliest: this.earliestDate ? iso < this.earliestDate : false,
+        });
+      }
+      this.weekDays = days;
+      this.canGoBack = !this.earliestDate || days[0].iso > this.earliestDate;
+      this.canGoForward = this.weekOffset < 0;
+    },
+
+    get gridColumns() {
+      return Math.ceil(Math.sqrt(this.cameras.length || 1));
+    },
+
+    async init() {
+      if (this._debugEnabled) {
+        window.addEventListener("pagehide", () => {
+          if (this._debugBuffer.length === 0) return;
+          const body = new Blob([JSON.stringify({ events: this._debugBuffer })], {
+            type: "application/json",
+          });
+          navigator.sendBeacon("/api/debug/log", body);
+          this._debugBuffer = [];
+        });
+      }
+      // Restore saved position before fetching so the week picker
+      // and segment fetch use the correct date.
+      const saved = this._restorePosition();
+      if (saved) this.selectedDate = saved.date;
+      try {
+        const [rangeRes, versionRes] = await Promise.all([
+          fetch("/api/recordings/range"),
+          fetch("/api/version"),
+        ]);
+        const range = await rangeRes.json();
+        if (range.earliest) {
+          this.earliestDate = range.earliest;
+        }
+        const version = await versionRes.json();
+        if (version.commit) {
+          this.version = version.commit;
+        }
+      } catch {}
+      this.buildWeek();
+      await this.fetchCameras();
+      this.wallTime = new Date(this.selectedDate + "T12:00:00");
+      await this.fetchAllSegments();
+      // Parse ?test_gap=HH:MM:SS-HH:MM:SS — dev hack to simulate an
+      // all-cameras-offline window on the currently selected day so
+      // the gap-skip path can be exercised without waiting for a
+      // real multi-camera outage.
+      const tgRaw = new URLSearchParams(location.search).get("test_gap");
+      if (tgRaw) {
+        const [fromStr, toStr] = tgRaw.split("-");
+        const fromMs = new Date(`${this.selectedDate}T${fromStr}`).getTime();
+        const toMs = new Date(`${this.selectedDate}T${toStr}`).getTime();
+        if (Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs > fromMs) {
+          this._testGap = [fromMs, toMs];
+        }
+      }
+      this.loading = false;
+      if (saved && saved.date === this.selectedDate) {
+        this.wallTime = new Date(saved.wallTimeMs);
+      } else {
+        this._pickInitialWallTime();
+      }
+      this.loadSegmentsForAll();
+      this._startSegmentRefresh();
+      this._startPositionSave();
+    },
+
+    _isToday() {
+      const now = new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      return this.selectedDate === today;
+    },
+
+    _startSegmentRefresh() {
+      this._stopSegmentRefresh();
+      if (!this._isToday()) return;
+      this._refreshId = setInterval(() => this.fetchAllSegments(), 60000);
+    },
+
+    _stopSegmentRefresh() {
+      if (this._refreshId) {
+        clearInterval(this._refreshId);
+        this._refreshId = null;
+      }
+    },
+
+    _pickInitialWallTime() {
+      // Find the earliest segment within the selected day across all cameras.
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
+      let earliest = null;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name];
+        if (!segs) continue;
+        for (const seg of segs) {
+          const t = new Date(seg.start_time).getTime();
+          if (t >= dayEnd) break; // sorted — past selected day
+          if (t >= dayStart) {
+            if (!earliest || t < earliest) earliest = t;
+            break; // first in-range segment for this cam
+          }
+        }
+      }
+      if (earliest) {
+        this.wallTime = new Date(earliest);
+      } else {
+        this.wallTime = new Date(this.selectedDate + "T12:00:00");
+      }
+    },
+
+    async changeDate(newDate) {
+      this.pause();
+      this.loading = true;
+      this.selectedDate = newDate;
+      this.wallTime = new Date(newDate + "T12:00:00");
+      // Tear down MediaSources before loading the new day so the first
+      // append lands on a fresh anchor instead of stitching across a
+      // many-hour gap.
+      this.cameras.forEach((_, idx) => {
+        this._resetCamMSE(idx);
+      });
+      await this.fetchAllSegments();
+      this.loading = false;
+      this._pickInitialWallTime();
+      this.loadSegmentsForAll();
+      this._startSegmentRefresh();
+    },
+
+    async fetchCameras() {
+      try {
+        const res = await fetch("/api/cameras");
+        this.cameras = await res.json();
+        this.cameras.forEach((_, idx) => {
+          this.camStates[idx] = this._freshCamState();
+        });
+      } catch (e) {
+        console.error("Failed to fetch cameras:", e);
+      }
+    },
+
+    _segFetchInFlight: false,
+
+    _threeDayRange() {
+      // Returns { rangeStart, rangeEnd } covering prev + current + next
+      // local days around selectedDate. DST-safe via Date constructor.
+      const [y, m, d] = this.selectedDate.split("-").map(Number);
+      return {
+        rangeStart: new Date(y, m - 1, d - 1),
+        rangeEnd: new Date(y, m - 1, d + 2),
+      };
+    },
+
+    _utcDatesForRange(rangeStart, rangeEnd) {
+      // Enumerate all UTC dates spanned by a local time range.
+      const dates = new Set();
+      for (let t = rangeStart.getTime(); t < rangeEnd.getTime(); t += 86400000) {
+        dates.add(new Date(t).toISOString().slice(0, 10));
+      }
+      // Also include the UTC date just before rangeEnd
+      dates.add(new Date(rangeEnd.getTime() - 1).toISOString().slice(0, 10));
+      return [...dates].sort();
+    },
+
+    async fetchAllSegments() {
+      if (this._segFetchInFlight) return;
+      this._segFetchInFlight = true;
+      try {
+        const { rangeStart, rangeEnd } = this._threeDayRange();
+        const rangeStartMs = rangeStart.getTime();
+        const rangeEndMs = rangeEnd.getTime();
+        const utcDates = this._utcDatesForRange(rangeStart, rangeEnd);
+
+        const results = await Promise.allSettled(
+          this.cameras.map(async (cam) => {
+            const allSegs = [];
+            for (const utcDate of utcDates) {
+              const res = await fetch(
+                `/api/cameras/${encodeURIComponent(cam.name)}/segments?date_str=${utcDate}`,
+              );
+              const segs = await res.json();
+              allSegs.push(...segs);
+            }
+            // Keep only segments within the 3-day local window
+            const filtered = allSegs.filter((seg) => {
+              const t = new Date(seg.start_time).getTime();
+              return t >= rangeStartMs && t < rangeEndMs;
+            });
+            filtered.sort((a, b) => a.start_time.localeCompare(b.start_time));
+            return { name: cam.name, segs: filtered };
+          }),
+        );
+
+        // Merge preserving object identity so state.currentSegment
+        // references survive across re-fetches.
+        const fresh = {};
+        for (const r of results) {
+          if (r.status !== "fulfilled") continue;
+          const { name, segs: newSegs } = r.value;
+          const old = this.segments[name] || [];
+          const byFile = new Map(old.map((s) => [s.filename, s]));
+          fresh[name] = newSegs.map((s) => {
+            const prev = byFile.get(s.filename);
+            if (prev && prev.duration_sec === s.duration_sec) return prev;
+            return s;
+          });
+        }
+        for (const cam of this.cameras) {
+          if (!(cam.name in fresh)) fresh[cam.name] = [];
+        }
+        this.segments = fresh;
+      } finally {
+        this._segFetchInFlight = false;
+      }
+    },
+
+    _parseStart(seg) {
+      return new Date(seg.start_time);
+    },
+
+    _latestEnd() {
+      // Find the latest playable segment end across all cameras.
+      // Segments without a positive duration are either still being recorded
+      // or failed to probe — skip them.
+      let latest = 0;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        for (let i = segs.length - 1; i >= 0; i--) {
+          if (segs[i].duration_sec > 0) {
+            const end = this._segEnd(segs, i);
+            if (end > latest) latest = end;
+            break;
+          }
+        }
+      }
+      return latest;
+    },
+
+    _earliestStart() {
+      // Find the earliest playable segment start across all cameras.
+      let earliest = Infinity;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        for (const seg of segs) {
+          if (seg.duration_sec > 0) {
+            const start = this._parseStart(seg).getTime();
+            if (start < earliest) earliest = start;
+            break;
+          }
+        }
+      }
+      return earliest === Infinity ? 0 : earliest;
+    },
+
+    _camIsMasterCandidate(idx) {
+      // A camera can drive the clock if it's actively rendering a
+      // segment that covers wallTime. Used by _pickClockMaster.
+      const s = this.camStates[idx];
+      const v = this.getVideo(idx);
+      if (!v || !s) return false;
+      if (!s.currentSegment || s.anchorMs == null) return false;
+      if (s.videoLoading) return false;
+      if (v.paused || v.seeking) return false;
+      return v.readyState >= 3;
+    },
+
+    _pickClockMaster() {
+      // Pick any camera currently rendering valid video. Hysteresis:
+      // prefer the previous master if it still qualifies, so we don't
+      // flap between cameras every frame when several are candidates.
+      if (this._inTestGap(this.wallTime.getTime())) return null;
+      const prev = this._clockMasterIdx;
+      if (prev != null && this._camIsMasterCandidate(prev)) return prev;
+      for (let i = 0; i < this.cameras.length; i++) {
+        if (this._camIsMasterCandidate(i)) return i;
+      }
+      return null;
+    },
+
+    _inTestGap(wallMs) {
+      // True iff the ?test_gap dev hack is active and wallMs falls
+      // inside the synthetic all-cameras-offline window.
+      const g = this._testGap;
+      return g != null && wallMs >= g[0] && wallMs < g[1];
+    },
+
+    _anyCamHasFootageAt(wallMs) {
+      // Segment-list query: does any camera have a recorded segment
+      // covering this instant? Distinguishes a real multi-camera gap
+      // (no footage exists) from a transient stall (footage exists,
+      // the video element just isn't ready yet).
+      if (this._inTestGap(wallMs)) return false;
+      const t = new Date(wallMs);
+      for (const cam of this.cameras) {
+        if (this.findSegmentAt(cam.name, t)) return true;
+      }
+      return false;
+    },
+
+    _nextFootageAfter(wallMs) {
+      // Earliest segment start across all cameras strictly after
+      // wallMs, or null if no more footage exists in the loaded set.
+      // Used to jump the clock forward across a gap.
+      // When the ?test_gap dev hack is active, ignore any real
+      // segments that start inside the synthetic gap so we skip past
+      // it instead of landing in the middle.
+      const threshold = this._testGap && wallMs < this._testGap[1] ? this._testGap[1] : wallMs;
+      let earliest = null;
+      for (const cam of this.cameras) {
+        const segs = this.segments[cam.name] || [];
+        for (const seg of segs) {
+          if (seg.duration_sec <= 0) continue;
+          const start = this._parseStart(seg).getTime();
+          if (start > threshold) {
+            if (earliest == null || start < earliest) earliest = start;
+            break; // segments are sorted — first match is this cam's earliest
+          }
+        }
+      }
+      return earliest;
+    },
+
+    _clampWallTime() {
+      // Keep wallTime inside the playable range so scrubbing past either
+      // end lands on a position where findSegmentAt actually returns a
+      // segment, rather than leaving the cameras showing "Offline".
+      //
+      // The upper clamp sits a full segment back from the newest closed
+      // segment across cameras, because ffmpeg's segment rotation isn't
+      // globally synchronized — one camera routinely sits up to a minute
+      // ahead of the others, and pinning to its edge would leave the
+      // other three cameras past their own latest-end.
+      const earliest = this._earliestStart();
+      const latest = this._latestEnd();
+      if (!earliest || !latest) return;
+      const t = this.wallTime.getTime();
+      if (t < earliest) {
+        this.wallTime = new Date(earliest);
+      } else if (t >= latest - this._segmentDurationMs) {
+        this.wallTime = new Date(Math.max(earliest, latest - this._segmentDurationMs));
+      }
+    },
+
+    _segEnd(segs, i) {
+      const start = this._parseStart(segs[i]).getTime();
+      if (segs[i].duration_sec > 0) {
+        return start + segs[i].duration_sec * 1000;
+      }
+      return start + this._segmentDurationMs;
+    },
+
+    findSegmentAt(camName, time) {
+      const segs = this.segments[camName] || [];
+      const t = time.getTime();
+      for (let i = 0; i < segs.length; i++) {
+        const start = this._parseStart(segs[i]).getTime();
+        const end = this._segEnd(segs, i);
+        if (t >= start && t < end) {
+          return { segment: segs[i], index: i };
+        }
+      }
+      return null;
+    },
+
+    findNextSegment(camName, currentSeg) {
+      const segs = this.segments[camName] || [];
+      const idx = segs.indexOf(currentSeg);
+      if (idx >= 0 && idx < segs.length - 1) {
+        return segs[idx + 1];
+      }
+      return null;
+    },
+
+    segmentUrl(camName, seg) {
+      return `/api/segments/${encodeURIComponent(camName)}/${seg.filename}`;
+    },
+
+    _debug(event) {
+      if (!this._debugEnabled) return;
+      this._debugBuffer.push({
+        wallMs: Date.now(),
+        perfMs: Math.round(performance.now()),
+        ...event,
+      });
+      if (this._debugBuffer.length >= 50) {
+        this._debugFlush();
+      } else if (!this._debugFlushTimer) {
+        this._debugFlushTimer = setTimeout(() => this._debugFlush(), 2000);
+      }
+    },
+
+    async _debugFlush() {
+      if (this._debugFlushTimer) {
+        clearTimeout(this._debugFlushTimer);
+        this._debugFlushTimer = null;
+      }
+      if (!this._debugEnabled || this._debugBuffer.length === 0) return;
+      const events = this._debugBuffer;
+      this._debugBuffer = [];
+      try {
+        await fetch("/api/debug/log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ events }),
+          keepalive: true,
+        });
+      } catch {}
+    },
+
+    _debugInstrumentVideo(idx, video) {
+      if (!this._debugEnabled) return;
+      const events = [
+        "emptied",
+        "loadstart",
+        "loadedmetadata",
+        "loadeddata",
+        "canplay",
+        "canplaythrough",
+        "playing",
+        "waiting",
+        "stalled",
+        "seeking",
+        "seeked",
+        "error",
+        "ended",
+      ];
+      events.forEach((name) => {
+        video.addEventListener(name, () => {
+          this._debug({
+            kind: "video",
+            ev: name,
+            cam: idx,
+            rs: video.readyState,
+            ns: video.networkState,
+            ct: Number(video.currentTime.toFixed(3)),
+            src: (video.src || "").split("/").pop(),
+            err: video.error ? video.error.code : null,
+          });
+        });
+      });
+    },
+
+    downloadUrl(idx) {
+      const cam = this.cameras[idx];
+      const state = this.camStates[idx];
+      if (!cam || !state?.currentSegment) return "#";
+      return this.segmentUrl(cam.name, state.currentSegment);
+    },
+
+    downloadFilename(idx) {
+      const cam = this.cameras[idx];
+      const state = this.camStates[idx];
+      if (!cam || !state?.currentSegment) return "";
+      // Prefix the camera name so downloads land with a useful
+      // filename; without this, Safari saves them as just the
+      // recorder's bare timestamp (2026-04-11_21-04-00.mp4) which is
+      // ambiguous when you download from multiple cameras.
+      return `${cam.name}_${state.currentSegment.filename}`;
+    },
+
+    getVideo(idx) {
+      return document.getElementById("video-" + idx);
+    },
+
+    loadSegmentsForAll() {
+      this.cameras.forEach((_, idx) => {
+        this.loadSegmentForCamera(idx);
+      });
+    },
+
+    _freshCamState() {
+      return {
+        currentSegment: null,
+        nextSegment: null,
+        videoLoading: false,
+        mediaSource: null,
+        mediaSourceReady: null, // Promise<void> resolving when MediaSource is 'open'
+        videoSB: null,
+        audioSB: null,
+        anchorMs: null,
+        appendedFilenames: new Set(),
+        appendQueue: [],
+        appending: false,
+        videoInitAppended: false,
+        audioInitAppended: false,
+        objectUrl: null,
+        fetchAbort: null, // AbortController for canceling stale fetches
+      };
+    },
+
+    loadSegmentForCamera(idx) {
+      const cam = this.cameras[idx];
+      const video = this.getVideo(idx);
+      if (!video || !cam) return;
+
+      const state = this.camStates[idx];
+      if (!state) return;
+
+      const found = this.findSegmentAt(cam.name, this.wallTime);
+
+      if (!found) {
+        // Distinguish a natural rotation gap (sub-second ffmpeg drift
+        // just past the current segment's end) from an explicit scrub
+        // into an empty region. For the former, leave stale state so
+        // the free-running clock walks out of the gap. For the latter,
+        // clear state and pause the video — otherwise the cam-0 clock
+        // sync in _startClock keeps reading the stale video position
+        // and snaps wallTime back to where the old segment lives.
+        const curSeg = state.currentSegment;
+        if (this.playing && curSeg) {
+          const segs = this.segments[cam.name] || [];
+          const i = segs.indexOf(curSeg);
+          if (i >= 0) {
+            const segEnd = this._segEnd(segs, i);
+            const wt = this.wallTime.getTime();
+            if (wt >= segEnd && wt < segEnd + 2000) return;
+          }
+        }
+        state.currentSegment = null;
+        state.nextSegment = null;
+        state.videoLoading = false;
+        if (video && !video.paused) video.pause();
+        return;
+      }
+
+      const seg = found.segment;
+      const next = this.findNextSegment(cam.name, seg);
+      this._debug({
+        kind: "load",
+        ev: "call",
+        cam: idx,
+        file: seg.filename,
+      });
+
+      state.currentSegment = seg;
+      state.nextSegment = next;
+
+      // Lazy-initialize the MediaSource on first real load.
+      if (!state.mediaSource) {
+        this._initMediaSource(idx);
+      }
+
+      const segStartMs = this._parseStart(seg).getTime();
+
+      if (state.appendedFilenames.has(seg.filename)) {
+        // Segment already in buffer: just seek (if needed) and resume play.
+        this._seekVideoMSE(idx);
+        if (this.playing && video.paused) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
+        }
+        // Opportunistic prefetch of the next segment.
+        this._enqueuePrefetch(idx, next);
+        return;
+      }
+
+      // Need to append this segment. Decide whether to flush first.
+      let needFlush = false;
+      if (state.anchorMs != null && state.videoSB && state.videoSB.buffered.length > 0) {
+        const buffEndWall = state.anchorMs + state.videoSB.buffered.end(0) * 1000;
+        const buffStartWall = state.anchorMs + state.videoSB.buffered.start(0) * 1000;
+        // "Far" = more than 2s outside the currently buffered wall range.
+        // Contiguous boundary transitions (prefetch not yet ready) land
+        // within 2s of buffEndWall and should append without flushing.
+        if (
+          segStartMs > buffEndWall + 2000 ||
+          segStartMs + this._segmentDurationMs < buffStartWall - 2000
+        ) {
+          needFlush = true;
+        }
+      }
+      // Segment starts before the anchor — sequence-mode append would
+      // place it after existing data, making the seek target negative.
+      // Flush so the anchor resets to this earlier segment.
+      if (!needFlush && state.anchorMs != null && segStartMs < state.anchorMs) {
+        needFlush = true;
+      }
+
+      state.videoLoading = true;
+
+      // Pause the video before flushing so it doesn't auto-play from
+      // position 0 when new buffer data appears. Resume after seek.
+      if (this.playing) {
+        const v = this.getVideo(idx);
+        if (v && !v.paused) v.pause();
+      }
+
+      // Cancel any in-flight fetch and clear stale queue entries so
+      // rapid scrubs (keyboard or mouse) don't pile up.
+      state.fetchAbort?.abort();
+      state.fetchAbort = new AbortController();
+      state.appendQueue = [];
+
+      if (needFlush) {
+        state.appendQueue.push({ type: "flush" });
+      }
+      state.appendQueue.push({ type: "append", segment: seg, forIdx: idx, seekAfter: true });
+      this._runAppendLoop(idx);
+
+      // Prefetch next segment too.
+      this._enqueuePrefetch(idx, next);
+    },
+
+    _enqueuePrefetch(idx, seg) {
+      if (!seg) return;
+      const state = this.camStates[idx];
+      if (!state) return;
+      if (state.appendedFilenames.has(seg.filename)) return;
+      if (
+        state.appendQueue.some((op) => op.type === "append" && op.segment.filename === seg.filename)
+      )
+        return;
+      state.appendQueue.push({ type: "append", segment: seg, forIdx: idx, seekAfter: false });
+      this._runAppendLoop(idx);
+    },
+
+    _initMediaSource(idx) {
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state || !video) return;
+      const ms = new MediaSource();
+      state.mediaSource = ms;
+      state.objectUrl = URL.createObjectURL(ms);
+      state.mediaSourceReady = new Promise((resolve, reject) => {
+        ms.addEventListener("sourceopen", () => resolve(), { once: true });
+        ms.addEventListener("error", () => reject(new Error("MediaSource error")), { once: true });
+      });
+      video.src = state.objectUrl;
+      video.muted = this.unmutedIdx !== idx;
+    },
+
+    async _runAppendLoop(idx) {
+      const state = this.camStates[idx];
+      if (!state || state.appending) return;
+      state.appending = true;
+      try {
+        await state.mediaSourceReady;
+        while (state.appendQueue.length > 0) {
+          // Bail if MediaSource was torn down (e.g., date change).
+          if (!state.mediaSource || state.mediaSource.readyState !== "open") break;
+          const op = state.appendQueue.shift();
+          if (op.type === "flush") {
+            await this._flushSourceBuffers(state);
+            continue;
+          }
+          // op.type === 'append'
+          try {
+            const bytes = await this._fetchSegmentBytes(idx, op.segment);
+            const tm = await this._transmuxSegment(bytes);
+            await this._appendToSourceBuffers(state, op.segment, tm);
+            state.appendedFilenames.add(op.segment.filename);
+            if (op.seekAfter) {
+              this._seekVideoMSE(idx);
+              const video = this.getVideo(idx);
+              if (video && this.playing) {
+                video.playbackRate = this.playbackSpeed;
+                video.play().catch(() => {});
+              }
+              state.videoLoading = false;
+            }
+            this._maybeBufferCleanup(state);
+          } catch (e) {
+            state.videoLoading = false;
+            this._debug({
+              kind: "load",
+              ev: "append-error",
+              cam: idx,
+              file: op.segment.filename,
+              err: String(e?.message || e),
+            });
+            // Drop this segment and keep going. The clock tick will
+            // eventually advance wallTime past it and ask for the next.
+          }
+        }
+      } finally {
+        state.appending = false;
+      }
+    },
+
+    async _fetchSegmentBytes(idx, seg) {
+      const cam = this.cameras[idx];
+      const state = this.camStates[idx];
+      const url = this.segmentUrl(cam.name, seg);
+      const res = await fetch(url, {
+        signal: state?.fetchAbort?.signal,
+      });
+      if (!res.ok) throw new Error("fetch " + res.status);
+      return await res.arrayBuffer();
+    },
+
+    _transmuxSegment(arrayBuffer) {
+      return new Promise((resolve, reject) => {
+        if (typeof MP4Box === "undefined") {
+          reject(new Error("MP4Box global not available"));
+          return;
+        }
+        const file = MP4Box.createFile();
+        const out = {
+          videoTrackId: null,
+          audioTrackId: null,
+          videoCodec: null,
+          audioCodec: null,
+          videoInit: null,
+          audioInit: null,
+          videoChunks: [],
+          audioChunks: [],
+        };
+        let readyFired = false;
+        file.onError = (e) => reject(new Error("mp4box parse: " + e));
+        file.onReady = (info) => {
+          readyFired = true;
+          for (const t of info.tracks) {
+            if (t.video && out.videoTrackId == null) {
+              out.videoTrackId = t.id;
+              out.videoCodec = t.codec;
+            } else if (t.audio && out.audioTrackId == null) {
+              out.audioTrackId = t.id;
+              out.audioCodec = t.codec;
+            }
+          }
+          for (const t of info.tracks) {
+            if (t.id === out.videoTrackId || t.id === out.audioTrackId) {
+              file.setSegmentOptions(t.id, null, { nbSamples: 100000 });
+            }
+          }
+          const inits = file.initializeSegmentation();
+          for (const init of inits) {
+            if (init.id === out.videoTrackId) out.videoInit = init.buffer;
+            else if (init.id === out.audioTrackId) out.audioInit = init.buffer;
+          }
+          file.start();
+        };
+        file.onSegment = (id, _user, buffer, _sampleNumber, _last) => {
+          if (id === out.videoTrackId) out.videoChunks.push(buffer);
+          else if (id === out.audioTrackId) out.audioChunks.push(buffer);
+        };
+        try {
+          const buf = arrayBuffer;
+          buf.fileStart = 0;
+          file.appendBuffer(buf);
+          file.flush();
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        if (!readyFired) {
+          reject(new Error("mp4box: onReady never fired"));
+          return;
+        }
+        if (!out.videoInit && !out.audioInit) {
+          reject(new Error("mp4box: no tracks extracted"));
+          return;
+        }
+        resolve(out);
+      });
+    },
+
+    async _appendToSourceBuffers(state, seg, tm) {
+      const ms = state.mediaSource;
+      if (!ms || ms.readyState !== "open") {
+        throw new Error("MediaSource not open");
+      }
+      // Create SourceBuffers on first append.
+      if (!state.videoSB && tm.videoInit && tm.videoCodec) {
+        const type = `video/mp4; codecs="${tm.videoCodec}"`;
+        if (!MediaSource.isTypeSupported(type)) {
+          throw new Error("unsupported video codec " + type);
+        }
+        state.videoSB = ms.addSourceBuffer(type);
+        state.videoSB.mode = "sequence";
+      }
+      if (!state.audioSB && tm.audioInit && tm.audioCodec) {
+        const type = `audio/mp4; codecs="${tm.audioCodec}"`;
+        if (MediaSource.isTypeSupported(type)) {
+          state.audioSB = ms.addSourceBuffer(type);
+          state.audioSB.mode = "sequence";
+        }
+        // If audio codec is unsupported, silently fall through —
+        // video-only playback is acceptable.
+      }
+
+      // Anchor on first successful append. With mode='sequence', the
+      // SourceBuffer auto-advances presentation timestamps — we only
+      // need the anchor to map video.currentTime back to wall time.
+      if (state.anchorMs == null) {
+        state.anchorMs = this._parseStart(seg).getTime();
+      }
+
+      if (state.videoSB) {
+        if (!state.videoInitAppended && tm.videoInit) {
+          await this._appendBytes(state.videoSB, tm.videoInit);
+          state.videoInitAppended = true;
+        }
+        for (const chunk of tm.videoChunks) {
+          await this._appendBytes(state.videoSB, chunk);
+        }
+      }
+      if (state.audioSB) {
+        if (!state.audioInitAppended && tm.audioInit) {
+          await this._appendBytes(state.audioSB, tm.audioInit);
+          state.audioInitAppended = true;
+        }
+        for (const chunk of tm.audioChunks) {
+          await this._appendBytes(state.audioSB, chunk);
+        }
+      }
+    },
+
+    _appendBytes(sb, bytes) {
+      return new Promise((resolve, reject) => {
+        const onEnd = () => {
+          cleanup();
+          resolve();
+        };
+        const onErr = () => {
+          cleanup();
+          reject(new Error("SourceBuffer append error"));
+        };
+        const cleanup = () => {
+          sb.removeEventListener("updateend", onEnd);
+          sb.removeEventListener("error", onErr);
+        };
+        sb.addEventListener("updateend", onEnd);
+        sb.addEventListener("error", onErr);
+        try {
+          sb.appendBuffer(bytes);
+        } catch (e) {
+          cleanup();
+          reject(e);
+        }
+      });
+    },
+
+    async _flushSourceBuffers(state) {
+      const sbs = [state.videoSB, state.audioSB].filter(Boolean);
+      for (const sb of sbs) {
+        try {
+          if (sb.updating) sb.abort();
+        } catch {}
+      }
+      for (const sb of sbs) {
+        if (sb.buffered.length === 0) continue;
+        await new Promise((resolve) => {
+          const onEnd = () => {
+            sb.removeEventListener("updateend", onEnd);
+            resolve();
+          };
+          sb.addEventListener("updateend", onEnd);
+          try {
+            sb.remove(0, Infinity);
+          } catch {
+            sb.removeEventListener("updateend", onEnd);
+            resolve();
+          }
+        });
+      }
+      // Reset timestampOffset so the next append in sequence mode
+      // starts at presentation time 0 (matching the fresh anchor).
+      for (const sb of sbs) {
+        try {
+          sb.timestampOffset = 0;
+        } catch {}
+      }
+      state.appendedFilenames = new Set();
+      state.anchorMs = null;
+      state.videoInitAppended = false;
+      state.audioInitAppended = false;
+    },
+
+    _seekVideoMSE(idx) {
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state || !video || state.anchorMs == null || !this.wallTime) return;
+      const target = (this.wallTime.getTime() - state.anchorMs) / 1000;
+      if (!Number.isFinite(target) || target < 0) return;
+      if (Math.abs(video.currentTime - target) > 0.5) {
+        video.currentTime = target;
+      }
+    },
+
+    _maybeBufferCleanup(state) {
+      // Trim old buffered data lazily to keep memory bounded. Best-effort.
+      // Runs from the append loop after a successful append; both SBs
+      // are idle at that point.
+      //
+      // Skip cleanup when the queue still has work — sb.remove() is
+      // async and sets sb.updating, which would cause the next
+      // appendBuffer to throw InvalidStateError.
+      if (state.appendQueue.length > 0) return;
+      const idx = Object.keys(this.camStates).find((k) => this.camStates[k] === state);
+      if (idx == null) return;
+      const videoEl = this.getVideo(Number(idx));
+      if (!videoEl) return;
+      const ct = videoEl.currentTime;
+      const sbs = [state.videoSB, state.audioSB].filter(Boolean);
+      for (const sb of sbs) {
+        if (sb.updating) continue;
+        if (sb.buffered.length === 0) continue;
+        const end = sb.buffered.end(0);
+        const start = sb.buffered.start(0);
+        if (end - start > 300 && ct - start > 90) {
+          try {
+            sb.remove(start, ct - 60);
+          } catch {}
+        }
+      }
+    },
+
+    _resetCamMSE(idx) {
+      // Tear down the MediaSource for this camera. Called on changeDate
+      // so the new day starts fresh without stitching across a huge
+      // anchor gap.
+      const state = this.camStates[idx];
+      const video = this.getVideo(idx);
+      if (!state) return;
+      // Abort any in-flight fetch so the old append loop exits quickly.
+      state.fetchAbort?.abort();
+      state.appendQueue = [];
+      // Don't force state.appending = false — let the old append loop
+      // exit via the mediaSource.readyState guard. Forcing it here
+      // could allow two concurrent loops.
+      state.appendedFilenames = new Set();
+      state.anchorMs = null;
+      state.videoInitAppended = false;
+      state.audioInitAppended = false;
+      state.videoSB = null;
+      state.audioSB = null;
+      state.currentSegment = null;
+      state.nextSegment = null;
+      state.videoLoading = false;
+      if (state.objectUrl) {
+        try {
+          URL.revokeObjectURL(state.objectUrl);
+        } catch {}
+        state.objectUrl = null;
+      }
+      state.mediaSource = null;
+      state.mediaSourceReady = null;
+      if (video) {
+        try {
+          video.pause();
+        } catch {}
+        video.removeAttribute("src");
+        try {
+          video.load();
+        } catch {}
+      }
+    },
+
+    togglePlay() {
+      if (this.playing) {
+        this.pause();
+      } else {
+        this.play();
+      }
+    },
+
+    play() {
+      this.playing = true;
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        const state = this.camStates[idx];
+        if (video && state?.currentSegment) {
+          video.playbackRate = this.playbackSpeed;
+          video.play().catch(() => {});
+        }
+      });
+      this._startClock();
+    },
+
+    pause() {
+      this.playing = false;
+      this._stopClock();
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        if (video && !video.paused) video.pause();
+      });
+    },
+
+    _startClock() {
+      this._stopClock();
+      let lastTick = performance.now();
+      const tick = (now) => {
+        if (!this.playing) return;
+
+        const dt = (now - lastTick) / 1000;
+        lastTick = now;
+        const settling = now < this._seekUntil;
+
+        if (!this.scrubbing && !this._fsScrubbing && !settling) {
+          // Pick any camera currently rendering valid video as the
+          // clock master. This invariant preserves "the timestamp in
+          // the UI matches the pixels on screen": wallTime is snapped
+          // to the master's currentTime so the displayed clock is
+          // never ahead of the frame it describes.
+          const masterIdx = this._pickClockMaster();
+          this._clockMasterIdx = masterIdx;
+
+          if (masterIdx != null) {
+            const v = this.getVideo(masterIdx);
+            const s = this.camStates[masterIdx];
+            this.wallTime = new Date(s.anchorMs + v.currentTime * 1000);
+          } else {
+            // No camera is currently rendering. Two cases:
+            //  (1) Known gap — the segment list says no camera has
+            //      footage covering wallTime. Skip gaps longer than
+            //      1s by jumping wallTime to the next recorded
+            //      footage across all cameras; play through shorter
+            //      ones in real time (brief ffmpeg rotation hitches).
+            //  (2) Stall — cameras have footage here but none is
+            //      ready yet (loading, seeking, initial startup).
+            //      Freeze if any load is in flight so wallTime
+            //      doesn't drift past the target; otherwise free-run.
+            const wallMs = this.wallTime.getTime();
+            if (!this._anyCamHasFootageAt(wallMs)) {
+              const nextMs = this._nextFootageAfter(wallMs);
+              if (nextMs != null && nextMs - wallMs > 1000) {
+                this._debug({
+                  kind: "gap_skip",
+                  from_ms: wallMs,
+                  to_ms: nextMs,
+                  span_ms: nextMs - wallMs,
+                });
+                this.wallTime = new Date(nextMs);
+                // Let cameras load the new segments before the clock
+                // block runs again — same settling treatment as a scrub.
+                this._seekUntil = performance.now() + 500;
+              } else {
+                this.wallTime = new Date(wallMs + dt * this.playbackSpeed * 1000);
+              }
+            } else {
+              const anyLoading = Object.values(this.camStates).some((s) => s?.videoLoading);
+              if (!anyLoading) {
+                this.wallTime = new Date(wallMs + dt * this.playbackSpeed * 1000);
+              }
+            }
+          }
+
+          // Stop at end of recordings
+          const latest = this._latestEnd();
+          if (latest && this.wallTime.getTime() >= latest) {
+            this.wallTime = new Date(latest);
+            this.pause();
+            this._clockId = null;
+            return;
+          }
+        }
+
+        this._checkDateCrossing();
+
+        // Sync all cameras: check segment boundaries, load new segments
+        for (let i = 0; i < this.cameras.length; i++) {
+          const state = this.camStates[i];
+          if (!state) continue;
+          const camName = this.cameras[i].name;
+          const segs = this.segments[camName] || [];
+          if (!state.currentSegment) {
+            const found = this.findSegmentAt(camName, this.wallTime);
+            if (found) this.loadSegmentForCamera(i);
+          } else {
+            const segIdx = segs.indexOf(state.currentSegment);
+            const segStart = this._parseStart(state.currentSegment).getTime();
+            const segEnd =
+              segIdx >= 0 ? this._segEnd(segs, segIdx) : segStart + this._segmentDurationMs;
+            const wt = this.wallTime.getTime();
+            if (wt >= segEnd || wt < segStart) {
+              this.loadSegmentForCamera(i);
+            } else if (state.anchorMs != null && !state.videoLoading) {
+              // Keep every camera in sync with wallTime via hard-seek
+              // drift correction. Applies to the clock master too: since
+              // wallTime was just snapped to the master's currentTime,
+              // the master's drift is zero and no seek fires. With MSE,
+              // video.currentTime is anchor-relative.
+              //
+              // Threshold is 0.5s. See DESIGN.md "Hybrid clock design":
+              // we considered a PI controller on playbackRate for
+              // sub-second corrections, but WebKit's sub-1% rate
+              // trimming is unreliable (see rate_test harness results
+              // in git history), so hard seeks are the only tool.
+              const video = this.getVideo(i);
+              if (video && !video.seeking && video.readyState >= 3) {
+                const offset = (wt - state.anchorMs) / 1000;
+                if (
+                  Number.isFinite(offset) &&
+                  offset >= 0 &&
+                  Math.abs(video.currentTime - offset) > 0.5
+                ) {
+                  video.currentTime = offset;
+                }
+              }
+            }
+          }
+        }
+
+        // Drift telemetry (throttled). When ?debug=1 is on, emit a
+        // per-camera snapshot once per second: how far each video's
+        // currentTime lags or leads the shared wallTime, whether it's
+        // the clock master, and basic media-element state. Makes drift
+        // problems visible in the debug log without a UI overlay.
+        if (this._debugEnabled && now - (this._lastDriftLogPerf || 0) >= 1000) {
+          this._lastDriftLogPerf = now;
+          const cams = [];
+          for (let i = 0; i < this.cameras.length; i++) {
+            const s = this.camStates[i];
+            const v = this.getVideo(i);
+            // Only report drift when the camera actually has a
+            // current segment. anchorMs lingers from prior loads
+            // even after a camera drops into a gap, so gating on
+            // anchorMs alone produces nonsense values like "102
+            // minutes of drift" for offline cameras.
+            const drift_ms =
+              v && s?.currentSegment && s.anchorMs != null
+                ? Math.round((v.currentTime - (this.wallTime.getTime() - s.anchorMs) / 1000) * 1000)
+                : null;
+            cams.push({
+              i,
+              drift_ms,
+              rs: v ? v.readyState : null,
+              p: v ? (v.paused ? 1 : 0) : null,
+              vl: s?.videoLoading ? 1 : 0,
+              seg: s?.currentSegment?.filename || null,
+            });
+          }
+          this._debug({
+            kind: "drift",
+            clock_ms: this.wallTime.getTime(),
+            master: this._clockMasterIdx,
+            spd: this.playbackSpeed,
+            cams,
+          });
+        }
+
+        this._clockId = requestAnimationFrame(tick);
+      };
+      this._clockId = requestAnimationFrame(tick);
+    },
+
+    _stopClock() {
+      if (this._clockId) {
+        cancelAnimationFrame(this._clockId);
+        this._clockId = null;
+      }
+    },
+
+    applySpeed() {
+      this.cameras.forEach((_, idx) => {
+        const video = this.getVideo(idx);
+        if (video) video.playbackRate = this.playbackSpeed;
+      });
+    },
+
+    toggleFullscreen(idx) {
+      this.fullscreenIdx = this.fullscreenIdx === idx ? null : idx;
+    },
+
+    toggleMute(idx) {
+      if (this.unmutedIdx === idx) {
+        // Mute this camera
+        const video = this.getVideo(idx);
+        if (video) video.muted = true;
+        this.unmutedIdx = null;
+      } else {
+        // Mute previously unmuted camera
+        if (this.unmutedIdx !== null) {
+          const prev = this.getVideo(this.unmutedIdx);
+          if (prev) prev.muted = true;
+        }
+        // Unmute this camera
+        const video = this.getVideo(idx);
+        if (video) video.muted = false;
+        this.unmutedIdx = idx;
+      }
+    },
+
+    handleKey(e) {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+      switch (e.code) {
+        case "Space":
+          e.preventDefault();
+          this.togglePlay();
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          this._seekByKey(e.shiftKey ? 5000 : 30000);
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          this._seekByKey(e.shiftKey ? -5000 : -30000);
+          break;
+        case "Escape":
+          this.fullscreenIdx = null;
+          break;
+      }
+    },
+
+    _seekUntil: 0, // performance.now() deadline; suppresses video→clock sync
+
+    _seekByKey(ms) {
+      this.wallTime = new Date(this.wallTime.getTime() + ms);
+      this._clampWallTime();
+      this._checkDateCrossing();
+      this._seekUntil = performance.now() + 500;
+      this.loadSegmentsForAll();
+    },
+
+    // -- Timeline --
+
+    timelineSegments(cam) {
+      const segs = this.segments[cam.name] || [];
+      const dayStart = this._startOfDay().getTime();
+      const dayEnd = dayStart + this._dayLengthMs();
+      const isRecording = cam.state === "recording";
+      return segs.filter((seg, i) => {
+        const t = new Date(seg.start_time).getTime();
+        if (t < dayStart || t >= dayEnd) return false;
+        // Valid duration: show it
+        if (seg.duration_sec > 0) return true;
+        // 0 = probed and failed; null = not yet probed.
+        // Show the newest not-yet-probed segment if the camera is
+        // actively recording (it's the live segment).
+        return seg.duration_sec == null && isRecording && i === segs.length - 1;
+      });
+    },
+
+    segmentBlockStyle(seg) {
+      const start = this._parseStart(seg);
+      const sod = this._startOfDay();
+      const dayLen = this._dayLengthMs();
+      const left = ((start - sod) / dayLen) * 100;
+      let durMs;
+      if (seg.duration_sec > 0) {
+        durMs = seg.duration_sec * 1000;
+      } else {
+        // Active recording: extend to now, capped at segment duration
+        durMs = Math.min(Date.now() - start.getTime(), this._segmentDurationMs);
+      }
+      const width = (durMs / dayLen) * 100;
+      return `left:${left}%;width:${width}%`;
+    },
+
+    // -- Scrubbing --
+
+    startScrub(e) {
+      this.scrubbing = true;
+      const point = e.touches ? e.touches[0] : e;
+      this._scrubToPoint(point);
+    },
+
+    doScrub(e) {
+      if (!this.scrubbing) return;
+      this._scrubToPoint(e);
+    },
+
+    endScrub() {
+      if (!this.scrubbing) return;
+      this.scrubbing = false;
+      this._checkDateCrossing();
+      this._seekUntil = performance.now() + 500;
+      this.loadSegmentsForAll();
+    },
+
+    _scrubToPoint(e) {
+      const overlay = this.$refs.timelineBody?.querySelector(".timeline-click-overlay");
+      if (!overlay) return;
+      const rect = overlay.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
+      this._clampWallTime();
+      // Don't load segments here — the cursor/time update instantly,
+      // and segments load on mouseup (endScrub). This prevents MSE
+      // flush+fetch+transmux storms during drag.
+    },
+
+    onTimelineHover(e) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const frac = x / rect.width;
+      this.hoverPct = frac * 100;
+      this.hoverTime = new Date(this._startOfDay().getTime() + frac * this._dayLengthMs());
+    },
+
+    get hoverTimeDisplay() {
+      if (!this.hoverTime) return "";
+      const d = this.hoverTime;
+      return [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map((n) => String(n).padStart(2, "0"))
+        .join(":");
+    },
+
+    // -- Fullscreen scrubbing --
+
+    _segmentDurationMs: 60000, // fixed 1-minute segments, see recorder.py
+    _fsScrubbing: false,
+    _fsScrubEl: null,
+
+    _fsTimeFromEvent(e) {
+      if (!this._fsScrubEl) return null;
+      const rect = this._fsScrubEl.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      return new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
+    },
+
+    startFsScrubOrSelect(e) {
+      this._fsScrubEl = e.currentTarget;
+      const point = e.touches ? e.touches[0] : e;
+      if (e.shiftKey) {
+        const clickedTime = this._fsTimeFromEvent(point);
+        if (!clickedTime) return;
+        this._extendOrCreateSelection(clickedTime);
+        return;
+      }
+      this.clearSelection();
+      this.startFsScrub(e);
+    },
+
+    startFsScrub(e) {
+      this._fsScrubbing = true;
+      this._fsScrubEl = e.currentTarget;
+      const point = e.touches ? e.touches[0] : e;
+      this._fsScrubToPoint(point);
+    },
+
+    doFsScrub(e) {
+      if (!this._fsScrubbing) return;
+      this._fsScrubToPoint(e);
+    },
+
+    endFsScrub() {
+      if (!this._fsScrubbing) return;
+      this._fsScrubbing = false;
+      this._fsScrubEl = null;
+      this._checkDateCrossing();
+      this._seekUntil = performance.now() + 500;
+      this.loadSegmentsForAll();
+    },
+
+    _fsScrubToPoint(e) {
+      if (!this._fsScrubEl) return;
+      const rect = this._fsScrubEl.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      this.wallTime = new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
+      this._clampWallTime();
+      // Don't load segments during drag — load on mouseup (endFsScrub).
+    },
+
+    // -- Range selection --
+
+    _timeFromOverlayEvent(e) {
+      const overlay = this.$refs.timelineBody?.querySelector(".timeline-click-overlay");
+      if (!overlay) return null;
+      const rect = overlay.getBoundingClientRect();
+      const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = x / rect.width;
+      return new Date(this._startOfDay().getTime() + pct * this._dayLengthMs());
+    },
+
+    startScrubOrSelect(e) {
+      const point = e.touches ? e.touches[0] : e;
+      if (e.shiftKey) {
+        const clickedTime = this._timeFromOverlayEvent(point);
+        if (!clickedTime) return;
+        this._extendOrCreateSelection(clickedTime);
+        return;
+      }
+      // Normal click: clear selection and scrub
+      this.clearSelection();
+      this.startScrub(e);
+    },
+
+    // -- Position persistence --
+
+    _startPositionSave() {
+      setInterval(() => this._savePosition(), 5000);
+      window.addEventListener("pagehide", () => this._savePosition());
+    },
+
+    _savePosition() {
+      if (!this.wallTime) return;
+      try {
+        sessionStorage.setItem(
+          "tinynvr_pos",
+          JSON.stringify({
+            date: this.selectedDate,
+            wallTimeMs: this.wallTime.getTime(),
+          }),
+        );
+      } catch {}
+    },
+
+    _restorePosition() {
+      try {
+        const raw = sessionStorage.getItem("tinynvr_pos");
+        if (!raw) return null;
+        const saved = JSON.parse(raw);
+        if (!saved.date || !saved.wallTimeMs) return null;
+        // Don't restore a future date.
+        const now = new Date();
+        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+        if (saved.date > today) return null;
+        return saved;
+      } catch {
+        return null;
+      }
+    },
+
+    _extendOrCreateSelection(clickedTime) {
+      if (this.selectionStart && this.selectionEnd) {
+        // Extend existing selection to include the clicked point.
+        // Adjust whichever endpoint is closer to the click.
+        const distToStart = Math.abs(clickedTime - this.selectionStart);
+        const distToEnd = Math.abs(clickedTime - this.selectionEnd);
+        if (distToStart < distToEnd) {
+          this.selectionStart = clickedTime;
+        } else {
+          this.selectionEnd = clickedTime;
+        }
+        // Keep start <= end
+        if (this.selectionStart > this.selectionEnd) {
+          [this.selectionStart, this.selectionEnd] = [this.selectionEnd, this.selectionStart];
+        }
+      } else {
+        // Create new selection from wallTime to clicked point.
+        if (this.wallTime < clickedTime) {
+          this.selectionStart = new Date(this.wallTime);
+          this.selectionEnd = clickedTime;
+        } else {
+          this.selectionStart = clickedTime;
+          this.selectionEnd = new Date(this.wallTime);
+        }
+      }
+    },
+
+    clearSelection() {
+      this.selectionStart = null;
+      this.selectionEnd = null;
+    },
+
+    selectionStyle() {
+      if (!this.selectionStart || !this.selectionEnd) return "display:none";
+      const sod = this._startOfDay();
+      const dayLen = this._dayLengthMs();
+      const startPct = ((this.selectionStart - sod) / dayLen) * 100;
+      const endPct = ((this.selectionEnd - sod) / dayLen) * 100;
+      const left = Math.max(0, Math.min(100, startPct));
+      const right = Math.max(0, Math.min(100, endPct));
+      if (right <= left) return "display:none";
+      return `left:${left}%;width:${right - left}%`;
+    },
+
+    selectionRangeDisplay() {
+      if (!this.selectionStart || !this.selectionEnd) return "";
+      const timeFmt = (d) =>
+        [d.getHours(), d.getMinutes(), d.getSeconds()]
+          .map((n) => String(n).padStart(2, "0"))
+          .join(":");
+      const sameDay =
+        this.selectionStart.getFullYear() === this.selectionEnd.getFullYear() &&
+        this.selectionStart.getMonth() === this.selectionEnd.getMonth() &&
+        this.selectionStart.getDate() === this.selectionEnd.getDate();
+      if (sameDay) {
+        return timeFmt(this.selectionStart) + " \u2013 " + timeFmt(this.selectionEnd);
+      }
+      const dateFmt = (d) => `${d.getMonth() + 1}/${d.getDate()} ${timeFmt(d)}`;
+      return dateFmt(this.selectionStart) + " \u2013 " + dateFmt(this.selectionEnd);
+    },
+
+    rangeDownloadUrl(camName) {
+      if (!this.selectionStart || !this.selectionEnd) return "#";
+      const s = this.selectionStart.toISOString();
+      const e = this.selectionEnd.toISOString();
+      return `/api/cameras/${encodeURIComponent(camName)}/download?start=${encodeURIComponent(s)}&end=${encodeURIComponent(e)}`;
+    },
+
+    _estimateDownloadSize(camName) {
+      const segs = this.segments[camName] || [];
+      if (!this.selectionStart || !this.selectionEnd || !segs.length) return 0;
+      const selStart = this.selectionStart.getTime();
+      const selEnd = this.selectionEnd.getTime();
+      let total = 0;
+      for (const seg of segs) {
+        const segStart = new Date(seg.start_time).getTime();
+        const dur = (seg.duration_sec || this._segmentDurationMs / 1000) * 1000;
+        const segEnd = segStart + dur;
+        if (segEnd <= selStart || segStart >= selEnd) continue;
+        // Pro-rate partial overlap
+        const overlapStart = Math.max(segStart, selStart);
+        const overlapEnd = Math.min(segEnd, selEnd);
+        const fraction = (overlapEnd - overlapStart) / dur;
+        total += (seg.size_bytes || 0) * fraction;
+      }
+      return total;
+    },
+
+    async downloadRange(camName) {
+      const url = this.rangeDownloadUrl(camName);
+      if (url === "#") return;
+      this.downloadingCam = camName;
+      this.downloadPercent = 0;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          const detail = await res.text();
+          alert("Download failed: " + detail);
+          return;
+        }
+
+        const estimatedSize = this._estimateDownloadSize(camName);
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (estimatedSize > 0) {
+            this.downloadPercent = Math.min(99, Math.round((received / estimatedSize) * 100));
+          }
+        }
+        this.downloadPercent = 100;
+
+        const blob = new Blob(chunks, { type: "video/mp4" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        const cd = res.headers.get("Content-Disposition");
+        const match = cd?.match(/filename="(.+)"/);
+        a.download = match ? match[1] : `${camName}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+      } catch (e) {
+        alert("Download failed: " + e.message);
+      } finally {
+        this.downloadingCam = null;
+        this.downloadPercent = null;
+      }
+    },
+  };
+}
+
+window.nvr = nvr;

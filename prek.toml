@@ -41,6 +41,21 @@ hooks = [
 repo = "https://github.com/AleksaC/hadolint-py"
 rev = "v2.14.0"
 hooks = [
-  # DL3018: pinning apk versions is moot under `FROM alpine:edge`.
-  { id = "hadolint", args = ["--ignore", "DL3018"] }
+  {
+    id = "hadolint",
+    args = [
+      # DL3018: pinning apk versions is moot under `FROM alpine:edge`.
+      "--ignore", "DL3018"
+    ]
+  }
+]
+
+[[repos]]
+repo = "https://github.com/biomejs/pre-commit"
+rev = "v0.6.1"
+hooks = [
+  {
+    id = "biome-check",
+    additional_dependencies = ["@biomejs/biome@2.4.11"]
+  }
 ]
