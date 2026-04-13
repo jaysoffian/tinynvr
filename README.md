@@ -105,3 +105,7 @@ Requires [mise-en-place](https://mise.jdx.dev) and [Podman](https://podman.io).
 make setup
 make check
 ```
+
+## License
+
+[MIT](./LICENSE)
