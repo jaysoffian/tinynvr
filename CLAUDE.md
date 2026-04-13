@@ -26,15 +26,13 @@ a "Why not HLS?" rationale.
 
 - Segments on disk are **non-fragmented MP4 with `moov` at front**
   (ffmpeg `-segment_format mp4 -segment_format_options
-  movflags=+faststart`). This is load-bearing for byte-range
-  scrubbing. Do not switch to fragmented MP4, HLS, or MSE — see
-  [DESIGN.md](DESIGN.md) "Why not HLS?" for the full rationale and
-  the specific regressions that killed the HLS branch.
+  movflags=+faststart`). Load-bearing for the download-range
+  endpoint's concat demuxer and for mp4box.js in-browser transmux.
+  Do not switch the on-disk format to fragmented MP4 or MPEG-TS.
 - `_SEGMENT_SECONDS` is fixed at 60 and intentionally not
-  configurable — see README.md "Why 1-minute segments".
-- Playback uses a single `<video>` element per camera. A
-  double-buffered swap was explored and reverted because it broke
-  Safari with 4 cameras. See DESIGN.md "Frontend: single <video>
-  per panel" before proposing a gapless-playback change — the
-  current small hitch at segment boundaries is a deliberate
-  trade-off, not an unsolved bug.
+  configurable — see DESIGN.md "Recording pipeline".
+- Playback uses **one `<video>` element per camera, fed via MSE +
+  mp4box.js**. Do not try a two-`<video>` double-buffered swap —
+  it was tried and broke Safari with 4 cameras. See DESIGN.md
+  "Rejected playback approaches" before proposing anything in the
+  gapless-playback area.

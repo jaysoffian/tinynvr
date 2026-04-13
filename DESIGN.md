@@ -58,52 +58,143 @@ a local NAS, not for multi-tenant or cloud deployment.
 
 ## Recording pipeline
 
-`tinynvr/recorder.py` runs one ffmpeg subprocess per enabled camera:
+`tinynvr/recorder.py` runs one ffmpeg subprocess per enabled
+camera. The full argv:
 
 ```
-ffmpeg -rtsp_transport tcp -timeout 30000000 -i <rtsp> \
-  -c copy \
-  -f segment -segment_time 60 -reset_timestamps 1 \
-  -segment_format mp4 -segment_format_options movflags=+faststart \
-  -segment_atclocktime 1 -strftime 1 \
-  {storage}/%Y-%m-%d/%H/{camera}/%M-%S.mp4
+ffmpeg
+  -hide_banner -loglevel warning
+  -rtsp_transport tcp
+  -timeout 30000000
+  -i <rtsp_url>
+  -c copy
+  -metadata title=<camera_name>
+  -f segment
+  -reset_timestamps 1
+  -segment_time 60
+  -segment_format mp4
+  -segment_format_options movflags=+faststart
+  -segment_atclocktime 1
+  -strftime 1
+  {storage}/%Y-%m-%d/%H/<camera>/%M-%S.mp4
 ```
 
-- **Nothing is ever transcoded** (`-c copy`). go2rtc is the upstream
-  and is expected to normalize each camera to H.264 + AAC before
-  TinyNVR sees it (the user does this via the `?mp4` stream variant
-  in go2rtc's stream URLs). If you're pointing TinyNVR at an RTSP source
-  that emits `pcm_mulaw` or another non-MP4 audio codec directly,
-  segments will fail to mux; fix the upstream, don't add an encode
+The subprocess is launched with `TZ=UTC` explicitly forced in its
+environment so strftime in the output pattern always expands to
+UTC regardless of the container's timezone. If this ever leaks,
+segment paths and `_parse_segment_path` fall out of sync.
+
+Every flag, and why it's there:
+
+- **`-hide_banner -loglevel warning`** — suppress the startup
+  banner and info chatter. Warnings and errors still reach stderr
+  where `_monitor` captures them into `last_error`. Without this,
+  every restart dumps a codec table into the logs.
+- **`-rtsp_transport tcp`** — force TCP for the RTSP media
+  session. UDP is the default and drops packets under any load,
+  producing decode errors in the segments. TCP costs a bit of
+  latency (irrelevant for a recording NVR) and in exchange
+  delivers every frame on a LAN.
+- **`-timeout 30000000`** — 30 seconds (in microseconds), the
+  RTSP socket I/O timeout. If the upstream goes silent, ffmpeg
+  exits with an error and `_monitor` restarts it with exponential
+  backoff. Without a timeout, ffmpeg hangs forever on a stalled
+  TCP socket and no segments land on disk.
+- **`-i <rtsp_url>`** — input URL from `config.yaml`, taken
+  verbatim. The user is responsible for making sure the upstream
+  emits H.264 + AAC; go2rtc's `?mp4` stream variant handles this.
+- **`-c copy`** — the load-bearing decision: nothing is ever
+  transcoded. ffmpeg is just demuxing RTSP and remuxing into MP4,
+  so CPU stays near zero on any host. The cost is that the
+  upstream must already be in a codec combination MP4 accepts —
+  if an RTSP source emits `pcm_mulaw` or similar directly,
+  segments fail to mux. Fix the upstream, don't add an encode
   step here.
-- **`-segment_atclocktime 1`** aligns segment boundaries to minute
-  boundaries on the wall clock, so segments across cameras are
-  roughly synchronized. They still drift by up to 1 minute because
-  ffmpeg rotates when its own I/O cycle hits the boundary, not
-  atomically across processes.
-- **`+faststart`** moves the `moov` atom to the front of each segment
-  on clean close, so Safari can start playing immediately without
-  seeking to the end of the file to find metadata.
-- **Segment length is fixed at 60 seconds** via `_SEGMENT_SECONDS` in
-  `recorder.py` and is intentionally not configurable. Two things
-  scale with segment length, and both favor short segments:
-  - **Playback latency to "live"**: a segment isn't playable until
-    ffmpeg closes it (the `moov` atom is written on close), so the
-    newest viewable footage is 0 to `segment_length` behind real
-    time. At 1 minute that's an average ~30 second lag.
-  - **Worst-case data loss on unclean shutdown**: if the machine
-    loses power or ffmpeg is SIGKILLed mid-segment, the in-progress
-    file has no `moov` atom and is unplayable — up to
-    `segment_length` of footage from that camera is lost. Clean
-    shutdowns (`docker stop`, Ctrl-C, `docker restart`) finalize
-    the current segment via SIGTERM and do *not* lose data.
+- **`-metadata title=<camera_name>`** — embed the camera name in
+  the MP4 `title` tag. Cosmetic: when a downloaded file is opened
+  in QuickTime or VLC, the player shows the camera name instead
+  of just the filename.
+- **`-f segment`** — use the segment muxer. The segment muxer is
+  a wrapper around another muxer (specified by `-segment_format`)
+  that rotates output files on a time or size trigger. Distinct
+  from `-f hls`, which would emit `.m3u8` + fragmented segments
+  (see "Why not HLS?" for why we don't).
+- **`-reset_timestamps 1`** — each output segment starts at
+  timestamp 0 instead of carrying through the RTSP timeline. This
+  makes every segment individually playable: a player opening
+  `27-02.mp4` sees a self-contained video beginning at t=0, not
+  one with a timestamp offset from some distant origin. Without
+  this, seeking inside a segment would need context the file
+  doesn't carry.
+- **`-segment_time 60`** — nominal segment length in seconds,
+  sourced from `_SEGMENT_SECONDS`. See the "Why 60 seconds"
+  discussion below.
+- **`-segment_format mp4`** — the inner muxer is non-fragmented
+  MP4. The segment muxer's default is MPEG-TS, which would emit
+  `.ts` files. We want MP4 specifically because (a) it's the
+  format the download-range concat demuxer and browser-side
+  mp4box.js both consume, and (b) it's what the non-fragmented-
+  MP4-with-moov-at-front guarantee applies to.
+- **`-segment_format_options movflags=+faststart`** — options
+  passed through to the inner MP4 muxer. `+faststart` relocates
+  the `moov` atom from end-of-file (MP4 default, needs a seek
+  back after mdat is written) to the front on clean close. This
+  is what makes byte-range access into a segment possible without
+  downloading the whole file first. Only applies to cleanly
+  closed segments — a SIGKILLed segment has no `moov` and is
+  unplayable (see the data-loss bullet below).
+- **`-segment_atclocktime 1`** — align segment rotations to
+  minute boundaries on the wall clock, not `ffmpeg_start_time +
+  N×60`. This keeps the four cameras' segments roughly aligned
+  so they stitch together cleanly in the grid UI. They still
+  drift by up to a full segment because each ffmpeg rotates when
+  its own I/O cycle hits the boundary, not atomically across
+  processes.
+- **`-strftime 1`** — enable `%Y`, `%m`, `%H`, etc. expansion in
+  the output filename. Without this, the pattern is literal and
+  ffmpeg overwrites the same file on every rotation. Note: the
+  segment muxer does **not** support `-strftime_mkdir 1` (that
+  flag only exists on the `hls` muxer), so the recorder has to
+  pre-create leaf directories itself — see "Pre-creating leaf
+  directories" below.
+- **Output pattern `{storage}/%Y-%m-%d/%H/<camera>/%M-%S.mp4`**
+  — strftime fields resolve at rotation time against the
+  subprocess's UTC environment, producing the storage layout
+  documented above.
 
-  Scrubbing responsiveness does *not* scale with segment length:
-  segments are self-contained MP4 with `moov` at the front, so the
-  browser byte-ranges directly to the nearest keyframe regardless of
-  segment length. Longer segments would save a trivial amount of
-  filesystem and ffprobe overhead, which isn't worth the
-  playback-latency or data-loss cost.
+### Why 60 seconds
+
+Segment length is fixed at 60 seconds and intentionally not
+configurable. Three things scale with segment length, and all
+three favor short segments:
+
+- **Playback latency to "live"**: a segment isn't playable until
+  ffmpeg closes it (the `moov` atom is written on close), so the
+  newest viewable footage is 0 to `segment_length` behind real
+  time. At 1 minute that's an average ~30 second lag.
+- **Worst-case data loss on unclean shutdown**: if the machine
+  loses power or ffmpeg is SIGKILLed mid-segment, the in-progress
+  file has no `moov` atom and is unplayable — up to
+  `segment_length` of footage from that camera is lost. Clean
+  shutdowns (`docker stop`, Ctrl-C, `docker restart`) finalize
+  the current segment via SIGTERM and do *not* lose data.
+- **Scrub latency**: under the current MSE + mp4box.js frontend,
+  each scrub into a new segment fetches the full segment,
+  transmuxes it, and appends it to the SourceBuffer. Cost is
+  roughly linear in segment length (~12 MB at 60s; at 600s it
+  would be ~120 MB per scrub). Short segments also match the
+  ~5-minute MSE buffer trim at a useful granularity — at 600s
+  segments the trim window wouldn't even fit one segment.
+
+A historical note: the pre-MSE playback path (`video.src = url`
+with Safari's native byte-range scrubber) did *not* scale scrub
+latency with segment length, because Safari would byte-range
+directly to the moov atom + nearest keyframe and fetch a few
+hundred KB regardless of the file's total size. That optimization
+was traded away when MSE shipped — see the Playback section's
+"Known trade-offs" and the "Rejected playback approaches" section
+for why MSE was still worth it. The 60-second choice became
+*more* defensible under MSE, not less.
 
 **Pre-creating leaf directories.** ffmpeg's segment muxer cannot
 create intermediate directories from its strftime output pattern
@@ -140,13 +231,12 @@ event), and re-probes them in parallel with a semaphore.
 
 ### Backend
 
-`GET /api/segments/{camera}/{filename}` is a **pure `FileResponse`**
-— no ffmpeg, no subprocess, no remux. Starlette handles HTTP
-`Range:` requests natively, and because segments are non-fragmented
-MP4 with `moov` at the front, Safari's byte-range scrubber can jump
-to any point in any segment by fetching only the needed byte range.
-This is the core reason scrubbing is fast: an intra-segment seek is
-one HTTP `206 Partial Content` response, not a full file download.
+`GET /api/segments/{camera}/{filename}` is a **pure `FileResponse`**.
+Starlette handles HTTP `Range:` requests natively, and because
+segments are non-fragmented MP4 with `moov` at the front, the
+browser can byte-range into any segment. This is what lets mp4box.js on the frontend fetch segments
+as ArrayBuffers cheaply, and what lets the download-range endpoint
+stitch segments via ffmpeg's concat demuxer without a remux pass.
 
 ### Frontend: the 4-camera timeline
 
@@ -178,6 +268,17 @@ fragmented in-browser by [mp4box.js](https://github.com/gpac/mp4box.js)
 SourceBuffers. Segment boundaries are gapless — the next segment's
 data is already in the buffer via prefetch, so playback continues
 without any `emptied` / `loadstart` cycle.
+
+`mode='sequence'` was essential. An earlier attempt with
+`mode='segments'` + per-segment `timestampOffset` broke because
+mp4box's fMP4 output has non-zero `baseMediaDecodeTime` values,
+which produced boundary stalls and misalignment between
+`video.currentTime` and the anchor model. `sequence` auto-advances
+timestamps and sidesteps both. Init segments are appended once per
+SourceBuffer lifetime (not per segment) — codec parameters are
+stable within a recording session since everything is `-c copy`
+from a stable go2rtc upstream. After a flush (scrub or date
+change), init is re-appended.
 
 **Anchor model.** Each camera tracks an `anchorMs` (the wall time
 of the first segment appended to its SourceBuffers). The video
@@ -230,14 +331,33 @@ the clock advances through a sub-second rotation gap. Any further
 "not found" — a deliberate scrub into an empty region, or a real
 multi-minute outage — clears `currentSegment`, pauses the camera's
 video, and lets the clock-master selection pick a different
-camera. Without this narrowing, a scrub into a gap would leave
-camera 0 playing a stale segment and the old static-master clock
-sync would snap `wallTime` backward to where that segment lived.
+camera.
 
-See the **"Gapless playback investigation"** section below for the
-full list of approaches tried before MSE (double-buffering,
-HTTP-cache prefetch, blob-URL prefetch, staggered loads), why each
-failed, and the trade-offs of the current MSE approach.
+**Known trade-offs of the MSE approach**:
+
+- **Scrub latency** ~300–500ms for a large time jump (full segment
+  fetch + transmux + append) vs ~250ms under the old `video.src =
+  url` approach that got Safari's native byte-range seek for free.
+  Timeline drags defer loading to mouseup so the cursor moves
+  smoothly but the frame only updates on release.
+- **Sequence-mode drift**: auto-advancing timestamps accumulate
+  sub-second duration mismatches between segments (~50 ms/segment
+  worst case). Bounded by the 500ms hard-seek drift correction,
+  reset on scrub.
+- **Full segment fetch**: ~12 MB per segment, vs the few-hundred-KB
+  moov+first-GOP that the old byte-range approach needed. Fine on a
+  LAN.
+- **Complexity**: the playback layer grew from ~80 lines under
+  `video.src = url` to ~300 lines under MSE. The state machine is
+  not simple.
+
+If scrub latency ever becomes intolerable, the avenue is
+incremental mp4box parsing (fetch the moov first via a byte range,
+then stream mdat chunks so the first GOP can be appended before
+the full download completes).
+
+See **"Rejected playback approaches"** below for the approaches
+tried before MSE and why each failed.
 
 ## Retention
 
@@ -269,10 +389,67 @@ we're only deleting hours that are days old — no conflict with
 
 `GET /api/cameras/{name}/download?start=...&end=...` returns a
 single MP4 stitched from the segments overlapping the requested
-range. Uses ffmpeg's concat demuxer with `-c:v copy -c:a aac` (AAC
-re-encode is harmless since inputs are already AAC) and streams
-the output to the client via `StreamingResponse`. The UI has a
+range. The handler queries `list_segments_for_range`, writes a
+concat list (one `file '/path/to/MM-SS.mp4'` per matching
+segment) to a tempfile, and streams an ffmpeg subprocess's
+stdout to the client via `StreamingResponse`. The UI has a
 selection-bar widget that sets `start`/`end` on shift-drag.
+
+The ffmpeg argv:
+
+```
+ffmpeg -hide_banner -loglevel error
+  -f concat -safe 0 -i <concat_list>
+  -ss <ss_offset> -t <trim_dur>
+  -c:v copy
+  -c:a aac
+  -movflags +frag_keyframe+empty_moov+default_base_moof
+  -f mp4 pipe:1
+```
+
+- **`-f concat -safe 0 -i <concat_list>`** — the concat demuxer
+  reads a text file listing input files and presents them as one
+  contiguous virtual stream. `-safe 0` allows absolute paths in
+  the list; the default rejects them as a path-traversal
+  mitigation, which we don't need since the paths come from our
+  own segment index.
+- **`-ss <ss_offset>` and `-t <trim_dur>`** — seek and duration,
+  placed **after** `-i` so they operate on the concatenated
+  virtual stream rather than on the first file only. `ss_offset`
+  is computed as `start_dt − first_segment_start` so the trim is
+  relative to the first segment's wall-clock start; `trim_dur` is
+  the requested range clamped to available footage.
+- **`-c:v copy`** — video passes through without re-encode.
+  Inputs are already H.264 and the trim output is still H.264,
+  so no pixels are decoded. Output-side `-ss` on `-c:v copy`
+  starts from the nearest preceding keyframe and drops frames
+  until the target, so the first up-to-GOP of video is cheap
+  padding, not a re-encode.
+- **`-c:a aac`** — audio **is** re-encoded, despite the inputs
+  already being AAC. This is deliberate: with output-side `-ss`
+  and `-c:a copy`, ffmpeg can only drop whole AAC frames
+  (~23 ms each) until the trim target, which leaves the start
+  audio up to a frame out of sync with the video. Decoding to
+  PCM and re-encoding lets ffmpeg emit audio that starts exactly
+  at `ss_offset` and stays tight. The re-encode is lossy but
+  the output is still AAC in — it's a harmless single round-trip.
+- **`-movflags +frag_keyframe+empty_moov+default_base_moof`** —
+  output is **fragmented MP4**. This is load-bearing and
+  contradicts the on-disk format constraint by design: ffmpeg is
+  writing to `pipe:1` (stdout) and pipes aren't seekable, but
+  non-fragmented MP4 needs to seek back to the front of the file
+  after mdat is written to fill in the `moov` atom. Fragmented
+  MP4 is the only MP4 shape that can be written straight through
+  a pipe. `empty_moov` writes a minimal header up front,
+  `frag_keyframe` starts a new fragment at each video keyframe,
+  and `default_base_moof` makes each fragment's data offsets
+  relative to its own `moof` (smaller and more widely supported).
+  **Do not "fix" this to match the on-disk format** — the two
+  formats serve different purposes (scrubbable storage vs
+  streamable output) and both are correct for their role.
+- **`-f mp4 pipe:1`** — force MP4 container and write to stdout.
+  Without `-f mp4`, ffmpeg would guess the container from the
+  output filename, and `pipe:1` has no extension to guess from.
 
 ## Build & deployment
 
@@ -306,623 +483,163 @@ cameras:
 ```
 
 `segment_minutes` used to be configurable (1–60) but is now fixed
-at 1 minute in `recorder.py` — see the Recording section above. The `.venv`,
-the recorder, the frontend fallback, and the retention math all
-share that assumption via `_SEGMENT_SECONDS` on the backend and
+at 1 minute in `recorder.py` — see the Recording section above. The
+recorder, the frontend fallback, and the retention math all share
+that assumption via `_SEGMENT_SECONDS` on the backend and
 `_segmentDurationMs = 60000` on the frontend.
 
 ## Why not HLS?
 
 TL;DR: HLS gives gapless playback as a byproduct of adaptive-bitrate
-streaming machinery that's completely wasted on a local-network
-single-bitrate NVR, and the storage format HLS requires broke
-scrubbing.
-
-We explored HLS at length. The whole approach was backed out in
-favor of the current static-MP4 + double-buffered `<video>` design.
-Here's why:
-
-### HLS requires fragmented MP4 (or MPEG-TS)
-
-HLS plays media as a sequence of "segments" fed to the browser
-through a `.m3u8` playlist. For MP4 containers this means
-*fragmented* MP4 — files that start with a tiny `moov` describing
-the timescale and an `EXT-X-MAP` init segment, followed by `moof` +
-`mdat` fragments. That's the only MP4 shape MSE / hls.js can chew.
-
-But fragmented MP4 with `+empty_moov+frag_keyframe+default_base_moof`
-doesn't have a self-describing `moov` at the front of each segment.
-The browser needs the init segment loaded before it can play any
-segment, and segment-relative seeks require MSE's SourceBuffer
-append timing to line up exactly. When we tried this:
-
-- **Byte-range scrubbing broke**. Safari's native `<video>` element
-  can byte-range into a self-contained MP4 with `moov` at front and
-  seek anywhere. With fragmented MP4, scrubbing requires hls.js to
-  parse the playlist, load the init segment, append fragments in
-  order, and map byte offsets to media time — all in JS. Every seek
-  became a sequence of HTTP fetches and buffer appends instead of
-  one `206 Partial Content`.
-- **Init-segment rotation got fragile**. ffmpeg's fragmented MP4
-  segmenter doesn't perfectly reuse an init segment across rotations
-  for all source streams, so we ended up either writing per-segment
-  init files or pinning one and hoping the timescale never changed.
-- **Media timestamps drifted** across segments under playback-rate
-  changes, producing audible stutter on speed controls.
-
-### HLS adds complexity that pays off only at scale
-
-HLS was designed for multi-bitrate adaptive streaming over lossy
-networks with variable bandwidth and intermediate CDNs. For that
-use case, the playlist + segment model is worth the complexity:
-you can swap down to a lower bitrate mid-stream, resume after a
-buffer underrun, etc. For TinyNVR:
-
-- Single fixed bitrate (whatever the camera emits).
-- Single client on a gigabit LAN talking to the NAS directly.
-- No CDN, no intermediate caches, no adaptive bitrate.
-
-The adaptive-streaming machinery — playlist generation, init
-segments, segment numbering, discontinuity tags, manifest refresh
-intervals, hls.js as a ~1MB JS dependency — is all dead weight.
-
-### The goal was gapless — we accepted a small hitch instead
-
-The actual goal of the HLS detour was *gapless playback across
-segment boundaries*. We didn't find a way to achieve that in
-Safari without breaking something else. A double-buffered
-`<video>` approach (two elements per panel, opacity swap, pending
-slot preloaded) worked for single-camera apps but misbehaved in
-a 4-camera grid — see the "Frontend: single `<video>` per panel"
-section above for details. So the shipped design accepts a
-~100–300ms load hitch at segment boundaries and keeps the
-recorder config and storage format untouched. Byte-range scrubbing
-still works unchanged (Safari seeks directly into any segment via
-HTTP `Range:`), which was the original bug that motivated all
-this work anyway.
-
-### What would bring HLS back
-
-Honest case: if TinyNVR ever needs multi-bitrate playback (phones
-on cellular watching the same footage the desktop is watching at
-full quality), or if it ever needs to serve footage across a WAN
-where the single-bitrate assumption breaks, HLS starts earning its
-keep. Neither of those is in scope.
-
----
-
-## Gapless playback investigation
-
-> If you're picking up the "segment-boundary flash is annoying"
-> thread, read this whole section before trying anything. Multiple
-> approaches have been tried, each built on a specific theory of the
-> bug, and each failed for a specific reason. The failure modes are
-> captured here so you don't have to rediscover them.
-
-### The shipped baseline
-
-One `<video>` element per camera panel. When `video.onended` fires,
-`_onSegmentEnd` advances `wallTime` to the next segment's start,
-`loadSegmentForCamera` sets `video.src = nextUrl`, and the
-`<video>` element runs its full load cycle: `emptied` →
-`loadstart` → `loadedmetadata` → `loadeddata` → `canplay` →
-`playing`. Between `emptied` and `loadeddata` the element shows a
-black frame. That's the flash. Measured duration on Safari 17+/
-macOS against the on-LAN NAS:
-
-- **~250–280ms for a concurrent transition** (family-room and
-  kitchen share an ffmpeg rotation boundary and both `ended` at
-  the same wall instant). Breakdown from a real debug trace:
-  - `ended → loadstart`: ~11ms (JS + event loop)
-  - `loadstart → loadedmetadata`: ~254ms (Safari fetches the moov
-    atom and initial GOP via HTTP byte-range requests)
-  - `loadedmetadata → loadeddata`: ~14ms (decoder init + first
-    GOP decode — essentially free)
-- **~200ms for a solo transition** (cam 3 transitioning alone).
-
-The 254ms `loadstart → loadedmetadata` window is the entire flash.
-Decoder re-init is rounding error.
-
-### The `!found`-skip-when-playing fix
-
-Before the investigation started, the flash looked worse than it
-should have because `loadSegmentForCamera`'s `!found` branch
-unconditionally cleared `video.src` whenever `findSegmentAt`
-returned null at the current wall time. On a transition, if a
-non-primary camera's segments had a sub-second rotation gap at
-the transition moment, its `!found` branch fired, the video
-element was emptied (black frame + "Offline" overlay), then a
-fraction of a second later the free-running clock advanced
-`wallTime` past the gap and the next tick reloaded. The result was
-a visible "Offline" flash on top of the underlying `<video>` load
-cycle.
-
-Fix: during live playback (`this.playing === true`), the `!found`
-branch returns silently instead of clearing state. The last frame
-stays visible, the clock advances through the gap, and the next
-tick finds a real segment. The overlay "Loading…" text is also
-scoped to cases where the camera has no segments for the entire
-day (real offline) vs. a transient gap (still loading).
-
-This is orthogonal to the prefetch story and should stay even if
-any future prefetch experiment is tried or reverted.
-
-### Failed approach #1: HLS (MPEG-TS + hls.js)
-
-Tried on a deleted branch called `hls`, across many hours of
-live iteration on the four-camera deployment. **The tried
-design did not work.**
-
-**What was actually implemented**. The recorder switched from Matroska to
-**MPEG-TS** via ffmpeg's segment muxer, *not* the HLS muxer:
-
-```
--c copy \
--f segment -segment_format mpegts -segment_time 10 \
--strftime 1 {camera}/%Y-%m-%d/%Y-%m-%d_%H-%M-%S.ts
-```
-
-Segments were flat-ish `.ts` files (10 seconds each, in per-day
-UTC subdirs). On the backend, a FastAPI endpoint synthesized an
-HLS `.m3u8` playlist on demand from the daily `.idx` duration
-files, emitting `EXT-X-PROGRAM-DATE-TIME` per segment and
-`EXT-X-DISCONTINUITY` between non-contiguous ones, with
-`EXT-X-PLAYLIST-TYPE:EVENT` on in-progress ranges so hls.js
-wouldn't pin to the live edge. Segments were served raw via
-`FileResponse`. Frontend used **hls.js** (not Safari's native
-HLS player) to consume the playlist.
-
-**This is classic HLS over MPEG-TS, not fragmented MP4.** The
-two are completely different on-disk formats. MPEG-TS (`.ts`)
-is a transport stream with PAT/PMT/PES packets, self-contained
-per segment. Fragmented MP4 (`.m4s` + separate `init.mp4`) uses
-`moof`/`mdat` box structure and references a shared init
-segment via `EXT-X-MAP`. They require different ffmpeg muxers
-(`-f segment -segment_format mpegts` vs `-f hls
--hls_segment_type fmp4`) and different playlist semantics.
-
-Problems observed during testing (per the user, after hours of
-live iteration):
-
-- **Could not get all four streams to load and play reliably.**
-  Some cameras would come up, others wouldn't, and which ones
-  varied run to run.
-- **When they did all play, they were never in sync** across
-  the 2×2 grid. The shared-wallTime-drives-all-cameras model
-  that works cleanly with plain `<video src=*.mp4>` didn't map
-  naturally onto four independent hls.js instances, each with
-  its own internal buffer and `currentTime`.
-- **Scrubbing didn't work.** Tagging in-flight playlists with
-  `EXT-X-PLAYLIST-TYPE:EVENT` got backward seeks into a
-  partially-working state, but grid-wide scrubbing never
-  became reliable.
-
-Which of these are inherent to HLS-via-hls.js vs fixable with
-more iteration is unclear. The branch ran out of energy before
-any of them was definitively solved or definitively shown to
-be unsolvable.
-
-**Fragmented MP4 HLS was planned but never implemented.** After
-the MPEG-TS iteration stalled with "hls
-plan.md" wrote a 1006-line plan to pivot away from hls.js and
-onto **Safari's native `<video src="playlist.m3u8">` player**
-with `-hls_segment_type fmp4`. That plan introduced supporting
-machinery appropriate for fMP4 HLS: one `init.mp4` per ffmpeg
-run, a run-to-init association rule (each segment's owning
-init is the newest historical init ≤ its timestamp), retention
-that kept historical inits alive until all their segments were
-deleted, startup reconciliation with a bounded unlink cap, and
-Python-side init file rotation because `-strftime 1` doesn't
-expand in the init filename parameter. None of this was coded
-— the recorder.py at the tip of `hls` still outputs
-MPEG-TS via the segment muxer. The branch was simply
-abandoned with the plan sitting there.
-
-**What this means for future attempts**:
-
-- **MPEG-TS + hls.js failed on a known set of problems** (4-
-  stream load reliability, cross-stream sync under shared
-  wallTime, scrub reliability). A future attempt has to solve
-  those three problems concretely, not assume they're
-  superficial.
-- **fMP4 HLS via Safari's native player is untested**. It
-  might work where MPEG-TS + hls.js didn't — Safari's native
-  HLS implementation is more mature than hls.js, and
-  native-player sync could conceivably be better than
-  independent hls.js instances. It also might not, and the
-  init-file / retention / reconciliation complexity is real.
-  Worth considering if the flash becomes intolerable, *not*
-  worth jumping into without scoping how much of the 1000-
-  line plan is actually necessary vs. written under pressure.
-
-### Failed approach #2: Double-buffered `<video>` swap (1a2619f2da → 77518f7b82)
-
-**Theory.** The flash is caused by `video.src = nextUrl` triggering
-a full load cycle, which involves both network fetch and decoder
-re-init. If we render two `<video>` elements per panel, keep one
-"pending" element primed with the next segment, and opacity-swap
-which element is visible at `onended`, there's no `src` change on
-the visible element — it was already loaded and ready to play.
-
-**Implementation.** Per-camera `activeSlot` of `'a'` or `'b'`
-drove a CSS `.active` class that toggled `opacity: 1` / `0`
-between two stacked, absolutely-positioned video elements.
-`_preloadPending()` assigned the next segment's URL to the
-pending slot with three redundant primers to work around Safari's
-hidden-element preload hedging:
-
-1. Append `#t=0.001` to the URL (Media Fragments URI spec initial
-   seek).
-2. `currentTime = 0.001` on `loadedmetadata`.
-3. Brief muted `play()` / `pause()` cycle to force first-GOP fetch
-   and decode.
-
-**Why it failed.** Worked cleanly with a single camera. With four
-cameras (8 total `<video>` elements), two things went wrong in
-Safari:
-
-- The doorbell camera started rendering a cropped frame after a
-  few scrubs. Initially loaded correctly, then post-scrub the
-  video element would display a zoomed-in portion of the frame.
-  No error, no CSS change — the `<video>` element's internal
-  rendering pipeline got stuck in a bad state.
-- The other three cameras "struggled" in ways the user described
-  as the flash still happening and some feeds not loading.
-- A Web Inspector Network panel capture showed the pending-slot
-  primer sequence producing a flurry of canceled and errored
-  byte-range requests (25–116-byte error bodies in red) for each
-  transition. Safari was starting a request, having it canceled
-  by the next primer step, starting another, canceling again.
-
-**Diagnosis (tentative).** Either Safari's hardware-H.264 decoder
-budget capped out around ~6 simultaneous elements and the
-doorbell's decoder state got evicted/corrupted, *or* the primer
-sequence (`src` → `load` → `currentTime` → `play` → `pause`) hit
-a race in Safari's internal state machine that it doesn't handle
-well. The network evidence points more strongly at the primer
-race than at the decoder budget — decoder exhaustion shows up as
-frozen frames, not canceled network requests. Unclear which
-dominates.
-
-**Outcome.** Reverted. Single `<video>` per camera. The flash came
-back but the doorbell stayed un-cropped.
-
-### Failed approach #3: HTTP cache prefetch via `fetch().blob()` (f14e2b177d → da2c41a1f6)
-
-**Theory.** Suggested by a second-opinion research agent as a
-fallback to double-buffering. The single `<video>` element stays,
-but ~N seconds before a transition we issue a plain `fetch()` for
-the next segment and drain the response via `.blob()` to force
-the browser to store the full response in its HTTP cache. The
-subsequent `video.src = nextUrl` should then read the bytes from
-disk cache instead of the network, cutting the `loadstart →
-loadedmetadata` window from ~250ms to ~30ms.
-
-**Implementation.** `_prefetchNextSegment(idx)` called from two
-places in `loadSegmentForCamera`: inside `onloadedmetadata` after
-a fresh load, and in the "already loaded" reseek branch. The
-backend `/api/segments/...` endpoint already sent
-`Cache-Control: public, max-age=31536000, immutable` so the
-cached response was reused indefinitely.
-
-**Why it failed.** Safari's `<video>` element does **not** read
-from the same HTTP cache that `fetch()` writes into. Confirmed
-via a HAR capture:
-
-```
-GET .../family-room/21-32-00.mp4  200  12344235 bytes  1401ms  (fetch prefetch)
-GET .../family-room/21-31-00.mp4  206  65581    bytes    77ms  (<video> range request)
-GET .../family-room/21-31-00.mp4  206  65581    bytes    91ms  (<video> range request)
-GET .../family-room/21-31-00.mp4  206  65581    bytes    75ms  (<video> range request)
-...
-```
-
-The prefetch row pulls the full 12 MB with a 200 response. Side
-by side, Safari's `<video>` element makes dozens of 64 KB
-`Range: bytes=X-Y` requests to the network fresh for the exact
-same filenames. Safari apparently maintains a separate media-
-resource cache for `<video>`/`<audio>` that doesn't share with
-the general HTTP cache. Historical behavior confirmed by a later
-debug-log capture: the `loadstart → loadedmetadata` window in
-playback logs stayed at ~250ms (the fresh network fetch time)
-even when the matching file had been fully prefetched 18 seconds
-earlier.
-
-**Outcome.** Pure wasted bandwidth — every segment was paying
-~double the network cost for zero playback benefit. Removed in
-the same revert as approach #4.
-
-### Failed approach #4: Blob-URL prefetch (cf6d1b8c14 → da2c41a1f6)
-
-**Theory.** If Safari's HTTP cache isn't shared with `<video>`,
-bypass the cache entirely. Keep the `fetch()` prefetch, but
-instead of draining the blob and hoping Safari uses the cache,
-hold the blob in JS memory and expose it via
-`URL.createObjectURL(blob)`. At transition time, assign the
-`blob:` URL to `video.src`. The `<video>` element reads bytes
-from memory, so the network-fetch phase of the load cycle is
-eliminated — only decoder re-init remains.
-
-**Implementation.** Per-camera state tracked three fields:
-
-- `state.prefetchedFilename` — which segment the current blob holds
-- `state.prefetchedBlobUrl` — `URL.createObjectURL(blob)` for it
-- `state.playingBlobUrl` — the blob URL currently bound to
-  `video.src`, tracked so it can be `revokeObjectURL`-ed when
-  replaced
-
-`loadSegmentForCamera` checked `state.prefetchedFilename ===
-seg.filename` and used the blob URL if it matched, otherwise
-fell through to the HTTP URL. Debug instrumentation logged
-`{kind: "load", ev: "use-blob"}` vs `"use-http"` on every load
-call so we could verify the hot path was being taken.
-
-**What the debug log showed.** The blob path *was* being taken
-for every transition after the first. Solo transition was
-measurably faster:
-
-| cam | concurrency | loadstart → loadedmetadata | total flash |
-|-----|-------------|----------------------------|-------------|
-|  3  | solo        | 188ms                      | 210ms       |
-|  1  | solo        | 187ms                      | 380ms       |
-|  0  | concurrent with cam 2 | **596ms**        | **613ms**   |
-|  2  | concurrent with cam 0 | **600ms**        | **624ms**   |
-
-**Why it failed.** Solo blob ~190ms *is* faster than solo HTTP
-~250ms. But in TinyNVR's usage pattern, two cameras (family-room
-and kitchen) share an ffmpeg rotation boundary and transition at
-the same real-time instant. When two video elements concurrently
-ingest blob URLs, Safari's metadata parse balloons to ~600ms on
-**both** cameras — roughly 3× the solo case. HTTP URLs under the
-same concurrent load stayed ~250ms per camera. Safari seems to
-serialize blob-URL video ingestion in a way it doesn't serialize
-HTTP fetches; the decoder or source-buffer setup fights over some
-shared resource and both lose.
-
-The net effect on the actual workload: **the user's concurrent
-flash got worse, not better** (600ms vs 250ms baseline). The user
-reported "no improvement whatsoever" after testing.
-
-Also discovered in the same log: `_prefetchNextSegment` could
-fire twice for the same segment. The dedup check required both
-`prefetchedFilename` match *and* `prefetchedBlobUrl` to be set,
-but while a fetch was in flight only the filename was set. A
-clock-tick-driven re-entry during the fetch passed the dedup
-test (null check) and started a second fetch. Small memory leak
-per duplicate blob, doubled prefetch bandwidth. Latent bug, but
-not the primary cause of the flash.
-
-**Outcome.** Reverted. `da2c41a1f6` restores plain
-`video.src = httpUrl` with no prefetch.
-
-### Failed approach #5: Staggered loads (b42e903a46 → afa7572382)
-
-**Theory.** Delay each camera's `loadSegmentForCamera` call by
-`idx * 100ms` so concurrent transitions don't hit Safari's
-metadata-parse path simultaneously. Each camera would flash for
-~190ms (solo speed) at slightly staggered times instead of two
-cameras blocking each other for ~600ms.
-
-**Outcome.** Tried and reverted. Did not help — the flash was
-still clearly visible and the staggering made the visual effect
-feel uneven rather than better. The fundamental issue (Safari
-re-fetching and re-parsing the moov atom on every `video.src`
-change) cannot be dodged by timing alone.
-
-### Approach #6: MSE via mp4box.js (shipped)
-
-Media Source Extensions let JavaScript feed media bytes to a
-`<video>` element via a `SourceBuffer` without a `src` change
-— the browser decodes appended chunks as one continuous stream,
-so segment boundaries become a `SourceBuffer.appendBuffer()`
-call with no `emptied` / `loadstart` cycle.
-
-**The initial plan assumed mux.js** (TS→fMP4 transmuxer), but
-mux.js only accepts MPEG-TS input, not ISOBMFF. The actual
-implementation uses **[mp4box.js](https://github.com/gpac/mp4box.js)**
-(0.5.3, 156 KB minified), which parses non-fragmented MP4 and
-emits fragmented MP4 (init segment + moof/mdat chunks) suitable
-for MSE `SourceBuffer.appendBuffer()`.
-
-**Per-camera pipeline:**
-
-```
-fetch(segmentUrl)
-  → arrayBuffer (full segment, ~12 MB)
-  → MP4Box.createFile() + appendBuffer + flush
-  → onReady: initializeSegmentation → init segments (ftyp+moov per track)
-  → onSegment: fragmented chunks (moof+mdat per track)
-  → SourceBuffer.appendBuffer(init), then appendBuffer(chunks)
-```
-
-Each camera has one `MediaSource` with separate video and audio
-`SourceBuffer`s, both in `mode='sequence'` (auto-advancing
-timestamps — eliminates gaps regardless of internal
-`baseMediaDecodeTime` values).
-
-**Risks from the plan vs actual outcome:**
-
-1. **Safari MSE contention** — did NOT materialize. Four
-   independent `MediaSource`/`SourceBuffer` sets work fine in
-   Safari 17+ on macOS. No serialization or decoder-budget
-   issues were observed, unlike the blob-URL path (approach #4).
-2. **Scrubbing** — required significant work. The `video.src`
-   approach got Safari's native byte-range seeking for free; MSE
-   requires JS to fetch the full segment, transmux, and append
-   before any frame appears. Scrub is noticeably slower than
-   pre-MSE (~300–500ms vs ~250ms) and required three follow-up
-   fixes: (a) deferring segment loads to mouseup during timeline
-   drags, (b) aborting stale fetches on rapid keyboard scrubs,
-   (c) freezing `wallTime` and pausing the video during loads to
-   prevent snap-back and fast-forward artifacts.
-3. **Complexity** — substantial. The playback layer grew from
-   ~80 lines (`loadSegmentForCamera` + `_seekVideo` +
-   `_onSegmentEnd`) to ~300 lines (MediaSource setup, mp4box
-   transmux, append loop with queue + abort, flush, seek, buffer
-   cleanup, MSE teardown for date changes). The `video.src = url`
-   pattern was simple; the MSE state machine is not.
-
-**Key implementation details:**
-
-- `mode='sequence'` was essential. The initial attempt used
-  `mode='segments'` with per-segment `timestampOffset`, which
-  broke because mp4box's fMP4 output has non-zero
-  `baseMediaDecodeTime` values. This caused gaps between
-  segments (stalls at boundaries) and misalignment between
-  `video.currentTime` and the anchor model (2-second seek
-  loops). Switching to `mode='sequence'` fixed both.
-- Per-camera `AbortController` for fetch cancellation prevents
-  stale fetch pileup during rapid scrubs.
-- `videoLoading` flag gates both clock sync (prevents snap-back
-  to pre-scrub position) and drift correction (prevents seeking
-  non-primary cameras while they're loading).
-- Video is explicitly paused before a SourceBuffer flush to
-  prevent auto-play from position 0 when new data appears.
-- Init segments are appended once per SourceBuffer lifetime
-  (not per segment), on the assumption that codec parameters
-  are stable within a recording session (true for `-c copy`
-  from a stable go2rtc upstream). After a flush (scrub or date
-  change), init is re-appended.
-
-**Approach #7 (`<link rel="preload" as="video">`) was not
-tried** — MSE solved the gapless problem, making it moot.
-
-### Diagnostic infrastructure
-
-`/api/debug/log` endpoints + `?debug=1` frontend instrumentation
-still live in the code. Load the UI with `?debug=1`, exercise a
-scenario, then:
-
-```bash
-curl https://nvr.example.com/api/debug/log > /tmp/tinynvr-debug.log
-curl -X DELETE https://nvr.example.com/api/debug/log   # clear
-```
-
-The log is newline-delimited JSON with `{perfMs, wallMs, cam,
-kind, ev, file, ...}` per event. Instrumented events: every
-`<video>` element lifecycle event (`emptied`, `loadstart`,
-`loadedmetadata`, `loadeddata`, `canplay`, `canplaythrough`,
-`playing`, `waiting`, `stalled`, `seeking`, `seeked`, `error`,
-`ended`) plus every `loadSegmentForCamera` call (`kind: "load"`,
-`ev: "call"`) and MSE append errors (`ev: "append-error"`).
-Zero cost when `?debug=1` is not on the URL.
-
-### Current assessment
-
-Segment-boundary playback is **gapless** via MSE + mp4box.js.
-The 250ms flash from the `video.src = url` era is gone. The
-trade-off is that scrubbing is slightly slower (full segment
-fetch + transmux + append vs Safari's native byte-range seek)
-and the playback layer is substantially more complex.
-
-**Known limitations of the MSE approach:**
-
-- **Scrub latency**: ~300–500ms to show a frame after a large
-  time jump (fetch + transmux + append), vs ~250ms with the old
-  `video.src` approach. Timeline drags defer loading to mouseup
-  to avoid storms, so the cursor moves smoothly but the video
-  frame only updates on release.
-- **Sequence-mode drift**: `mode='sequence'` auto-advances
-  timestamps, which means sub-second duration mismatches between
-  segments accumulate over time (~50ms/segment worst case, ~3s
-  after 1 hour). The dynamic clock master (see "Hybrid clock
-  design" below) snaps `wallTime` to whichever camera is currently
-  rendering, and a 500ms hard-seek drift correction on all other
-  cameras bounds accumulated divergence. A scrub resets the
-  anchor and eliminates accumulated drift.
-- **Full segment fetch**: the old approach let Safari fetch only
-  the moov atom + initial GOPs via byte-range requests (~300 KB
-  to start playing). MSE requires the full segment (~12 MB) to
-  transmux. This is fine on a LAN but would be a problem over a
-  slow link.
-
-**If scrub latency becomes intolerable**, the main avenue is
-incremental mp4box parsing: fetch just the moov (first ~50 KB,
-already at front thanks to `movflags=+faststart`), let mp4box
-parse it, then stream the mdat in chunks so the first GOP can
-be appended and displayed before the full segment is downloaded.
-mp4box.js supports incremental `appendBuffer` with `fileStart`
-offsets, but the integration is substantially more complex than
-the current whole-file approach.
-
-Do not re-try double-buffering (#2), HTTP-cache prefetch (#3),
-blob-URL prefetch (#4), or staggered loads (#5) without reading
-the failure details above.
+streaming machinery that's wasted on a local LAN single-bitrate
+NVR, and both on-disk formats it supports broke something when
+tried.
+
+HLS needs either fragmented MP4 (`.m4s` + shared init segment) or
+MPEG-TS segments. Both were tried. Both lost.
+
+- **Fragmented MP4 would break byte-range access to self-contained
+  segments.** Non-fragmented MP4 with `moov` at front lets any
+  client byte-range directly into a keyframe with one
+  `206 Partial Content`. Fragmented MP4 requires parsing the
+  playlist, loading the init segment, and appending fragments in
+  order before any frame appears. The non-fragmented shape is also
+  what the download-range endpoint's ffmpeg concat demuxer consumes
+  with `-c copy`, and what mp4box.js in the browser transmuxes to
+  feed MSE. Switching the on-disk format would break all three
+  read paths.
+- **MPEG-TS + hls.js never worked in a 4-camera grid.** Tried on
+  the deleted `hls` branch with ffmpeg `-segment_format mpegts`
+  10-second segments and a FastAPI-synthesized `.m3u8` using
+  `EXT-X-PROGRAM-DATE-TIME` and `EXT-X-DISCONTINUITY`. Three
+  problems were observed and none were solved before the branch
+  ran out of energy: (1) four cameras would not load and play
+  reliably (different cameras came up run-to-run), (2) when they
+  did all play they were never in sync across the grid — the
+  shared-`wallTime`-drives-all-cameras model that works with
+  plain `<video>` didn't map onto four independent hls.js
+  instances each with its own internal buffer, (3) grid-wide
+  scrubbing didn't work.
+
+The adaptive-bitrate machinery HLS exists for — playlist
+generation, init segments, discontinuity tags, hls.js as a ~1 MB
+dependency — buys nothing on a single-bitrate LAN NVR. The only
+thing it was going to earn us was gapless playback, and
+MSE + mp4box.js got us that without changing the on-disk format.
+
+A fragmented-MP4 HLS retry via Safari's native `<video
+src="playlist.m3u8">` was planned on the delete `hls` branch but
+never implemented. If scrub-latency
+pain ever makes this worth revisiting, the plan is there — but
+scope what's actually needed instead of picking it up whole.
+
+## Rejected playback approaches
+
+Read this before proposing anything in the segment-boundary /
+gapless / prefetch area. Each approach here was built on a
+specific theory; each failed for a specific reason.
+
+### The pre-MSE baseline
+
+Before MSE shipped, each camera used one `<video>` element with
+`video.src = nextUrl` on `onended`. That produced a ~250ms flash
+at every segment boundary on Safari 17+ / macOS — almost entirely
+`loadstart → loadedmetadata` (Safari refetching the moov atom and
+initial GOP via HTTP byte-range requests). Concurrent transitions
+(two cameras sharing an ffmpeg rotation boundary) stayed at the
+same ~250ms per camera; decoder re-init was rounding error. The
+goal of everything below was eliminating that flash.
+
+### The `!found`-skip-when-playing narrowing
+
+Before the investigation started, `loadSegmentForCamera`'s
+`!found` branch unconditionally cleared `video.src` whenever
+`findSegmentAt` returned null at the current wall time. On a
+transition, a non-primary camera with a sub-second rotation gap
+would flash "Offline" on top of the underlying load cycle. The
+narrowing: during live playback, `!found` within 2s past the
+current segment's end returns silently instead of clearing state.
+Still needed under MSE to keep ffmpeg rotation hitches from
+bouncing cameras out of master eligibility. Do not remove.
+
+### Rejected approaches
+
+1. **Double-buffered `<video>` swap** (1a2619f2da → 77518f7b82).
+   Theory: two `<video>` elements per panel, pending slot primed
+   with next segment, opacity swap at `onended`. Primer sequence
+   was `#t=0.001` URL fragment + `currentTime = 0.001` on
+   `loadedmetadata` + muted play/pause cycle. Worked with a single
+   camera. With four cameras (8 `<video>` elements), Safari's
+   doorbell camera started rendering a cropped frame after a few
+   scrubs, and a Web Inspector network capture showed the primer
+   sequence producing a flurry of canceled byte-range requests.
+   Either the hardware-decoder budget hit its limit around ~6
+   simultaneous elements, or the primer sequence raced Safari's
+   internal state machine — the canceled-requests evidence points
+   at the race. **Reverted.** Do not reintroduce two `<video>`
+   elements per panel.
+
+2. **HTTP-cache prefetch via `fetch().blob()`** (f14e2b177d →
+   da2c41a1f6). Theory: warm Safari's HTTP cache N seconds before
+   a transition so the subsequent `video.src = nextUrl` reads from
+   disk instead of network. **Safari's `<video>` does not read
+   from the same cache `fetch()` writes into.** A HAR capture
+   confirmed: the prefetch pulled the full 12 MB with a 200
+   response, and side-by-side the `<video>` element then made
+   dozens of fresh 64 KB `Range:` requests for the same file.
+   Pure wasted bandwidth. **Reverted.**
+
+3. **Blob-URL prefetch** (cf6d1b8c14 → da2c41a1f6). Theory:
+   since Safari's `<video>` doesn't share the HTTP cache, bypass
+   it. Hold the prefetched blob in JS memory, expose via
+   `URL.createObjectURL(blob)`, and assign the blob URL at
+   transition time. Solo transitions dropped to ~190ms. But in
+   TinyNVR's actual workload two cameras share an ffmpeg rotation
+   boundary and transition concurrently; under concurrent load
+   Safari serialized blob-URL video ingestion and **both**
+   cameras ballooned to ~600ms — almost 3× the solo case, and
+   worse than the ~250ms HTTP baseline. Net effect: concurrent
+   flash got worse. **Reverted.**
+
+4. **Staggered loads** (b42e903a46 → afa7572382). Theory: delay
+   each camera's load by `idx * 100ms` so concurrent transitions
+   don't hit Safari's metadata parse simultaneously. Did not help.
+   The fundamental issue — Safari re-fetching and re-parsing the
+   moov atom on every `video.src` change — cannot be dodged by
+   timing alone. **Reverted.**
+
+5. **HLS (MPEG-TS + hls.js)** — see "Why not HLS?" above.
+
+### Why MSE + mp4box.js shipped where blob-URL failed
+
+The blob-URL approach (#3) failed because Safari serialized
+blob-URL video ingestion across concurrent transitions. MSE with
+`MediaSource` / `SourceBuffer` feeds bytes directly from JS to the
+decoder without any `src` change; in Safari 17+ four independent
+`MediaSource` instances run without the serialization penalty
+that killed blob-URL. Segment boundaries become an
+`appendBuffer()` call with no `emptied` / `loadstart` cycle at
+all. Safari MSE contention was the big risk from the plan and
+didn't materialize.
+
+Approach #7 (`<link rel="preload" as="video">`) was considered and
+not tried — MSE solved the gapless problem, making it moot.
+
+Do not re-try any of #1–#5 without reading the failure details
+above.
 
 ## Hybrid clock design
 
 The raf-driven playback clock is the most subtle part of the
-frontend. This section documents how it works, why it was
-rewritten in April 2026, and the dead ends explored on the way —
-so "future you" doesn't re-propose any of them.
+frontend. The invariant is **the `wallTime` shown in the UI must
+match the pixels on screen** — "14:25:54" in the header has to
+mean the frame you are looking at was recorded at 14:25:54. If
+the clock runs ahead of the video (because a video element
+stalled, decoded slowly, or is in a gap), the user sees a
+misleading timestamp. Everything here is in service of that
+invariant.
 
-### The invariant
-
-**The `wallTime` shown in the UI must match the pixels on screen.**
-For an NVR, "14:25:54" in the header has to mean "the frame you
-are looking at was recorded at 14:25:54." If the clock runs ahead
-of the video (because a video element stalled, decoded slowly, or
-was in a gap), the user sees a misleading timestamp. Preserving
-this invariant constrains the design.
-
-### The old static-master design and why it broke
-
-The original clock tick used **camera 0 as a fixed clock master**:
-
-```js
-if (v0 && s0?.currentSegment && !s0.videoLoading && v0.readyState >= 3) {
-  wallTime = s0.anchorMs + v0.currentTime * 1000;  // sync from cam 0
-} else if (!s0.videoLoading) {
-  wallTime += dt * playbackSpeed;                  // free-run
-}
-// else: freeze while cam 0 is loading
-```
-
-Cameras 1–3 were kept in lockstep via a > 2s hard-seek drift
-correction. The choice of camera 0 was arbitrary ("first camera in
-the array"), not principled. Two bugs fell out of that
-arbitrariness:
-
-1. **Scrub-into-gap snap-back.** If the user scrubbed to a time
-   where camera 0 had no footage, `loadSegmentForCamera` hit the
-   `!found` branch and returned early during playback, leaving
-   `state.currentSegment` pointing at the pre-scrub segment. The
-   clock kept reading `v0.currentTime` of that stale segment and
-   snapped `wallTime` backward to where the stale segment lived.
-   Repeated scrubs could dig out of it by luck, but the UX was
-   broken.
-2. **Cam-0-offline kills playback.** If camera 0 was in a
-   multi-minute gap, the clock free-ran while cameras 1–3 played
-   at media rate. `wallTime` drifted relative to their timelines,
-   the > 2s drift correction triggered, and cameras 1–3 visibly
-   jerked back every few seconds for the entire outage. In the
-   user's production config, **camera 1 (index 1)** is the most
-   reliable stream; camera 0's outages routinely broke playback
-   for everyone.
-
-### What was considered
-
-An expert consultation on clock sync / PLL weighed three options:
-
-- **Option A — dynamic master selection.** Still pick a single
-  master each tick, but from any rendering camera with
-  hysteresis. Master drift correction on all slaves.
-- **Option B — `wallTime` as authoritative, videos as slaves.**
-  Clock free-runs via `wallTime += dt * speed` each tick. All
-  cameras drift-correct toward `wallTime`. No privileged camera.
-- **Option C — hybrid.** `wallTime` free-runs EXCEPT when a
-  rendering master exists, in which case it's snapped to the
-  master each tick. Preserves "clock matches pixels" (Option A's
-  property) without a static master (Option B's simplicity).
-
-**Option B was rejected** because of the invariant: when a video
-stalls on a segment append or decoder starvation, pure free-run
-lets `wallTime` run ahead of the actual frame on screen. For an
-NVR, that's a correctness bug.
-
-### What shipped: Option C
-
-Five rules:
+### Shipped design
 
 1. `wallTime` is authoritative for UI, scrubber, and segment
    lookups.
@@ -930,136 +647,86 @@ Five rules:
    whose `currentSegment` covers `wallTime` and whose `<video>` is
    ready (`readyState >= HAVE_FUTURE_DATA`, not paused/seeking,
    not `videoLoading`). Hysteresis prefers the previous tick's
-   master so master selection doesn't flap every frame.
+   master so selection doesn't flap every frame.
 3. If a master exists, `wallTime` is snapped to
    `master.anchorMs + master.video.currentTime * 1000` before
-   anything else runs — this is what preserves "UI time matches
-   pixels."
+   anything else runs — this preserves "UI time matches pixels."
 4. If no master qualifies, distinguish two sub-cases via the
    segment list:
    - **Known gap** (no camera has a segment covering `wallTime`):
-     look up `_nextFootageAfter(wallMs)` — the earliest segment
-     start across all cameras strictly greater than `wallMs`. If
-     that's more than 1 second ahead, jump `wallTime` to it and
-     set `_seekUntil = now + 500` so the per-camera sync loop can
-     load the new segments cleanly. Short gaps (< 1s) play through
-     in real time so sub-second ffmpeg rotation hitches don't
+     look up `_nextFootageAfter(wallMs)`; if more than 1s ahead,
+     jump `wallTime` forward and set `_seekUntil = now + 500` so
+     per-camera sync can load cleanly. Short gaps (< 1s) play
+     through in real time so sub-second rotation hitches don't
      trigger a skip.
    - **Stall** (some camera has a segment covering `wallTime` but
-     none is ready yet): if any camera is `videoLoading`, freeze
-     `wallTime` so it doesn't drift past the scrub target while
-     loads are in flight. Otherwise free-run briefly.
+     none is ready): freeze `wallTime` if any camera is
+     `videoLoading`, otherwise free-run briefly.
 5. Every camera — master included — runs hard-seek drift
-   correction at a **500ms** threshold (lowered from 2s). The
-   master self-corrects to a no-op because `wallTime` was just
-   sourced from it.
+   correction at a **500ms threshold**. The master self-corrects
+   to a no-op because `wallTime` was just sourced from it.
 
-### Why hard-seek drift correction instead of PI-controlled `playbackRate`
-
-The expert's actual recommendation was to replace the hard-seek
-rule with a PI controller on `video.playbackRate` — small
-trims like `playbackRate = 1.02` instead of visible seeks.
-Shaka Player, Chromecast multi-room audio, and similar projects
-do this for exactly this kind of multi-stream sync. Seeks cause
-stalls; rate trims are invisible.
-
-**This was tried on Safari and rejected.** A standalone rate-test
-harness (`static/rate_test.html`, reachable at `/rate_test.html`
-with `?debug=1`-style auto-report to `/api/debug/log`) loaded a
-real segment via a plain `<video src=>` element (not MSE) and
-measured effective rate as `Δvideo.currentTime / Δwall` over
-8-second windows at target rates 1.00, 1.02, 1.05, 1.10, 0.98,
-0.90. On Safari 26.3.1 / WebKit 605.1.15 the results were
-incoherent:
-
-```
-target  effective   Δmedia     Δwall    honored?
-1.00×   0.8580      6.8647 s   8.001 s  NO
-1.02×   0.9275      7.4201 s   8.000 s  NO
-1.05×  -0.0249     -0.1990 s   8.001 s  NO (currentTime went BACKWARDS)
-1.10×   0.8972      7.1786 s   8.001 s  NO
-0.98×   0.7812      6.2494 s   8.000 s  NO
-0.90×   0.7075      5.6605 s   8.001 s  NO
-```
-
-Effective rates don't track the target, don't scale linearly, and
-one test reported `currentTime` going *backwards* over 8 seconds
-of wall time — impossible under normal playback. **The same
-harness was then run on Chrome and Firefox and both browsers
-honored every target rate cleanly** (Δmedia ≈ target × Δwall
-within the 0.5% epsilon), so the Safari result is a real WebKit
-limitation, not a harness bug. Safari is the only target browser
-for TinyNVR, so we abandoned the PI-controller idea entirely.
-Keep `rate_test.html` around — if a future WebKit build changes
-this behavior, re-run the same test before proposing any control
-loop.
-
-**Instead:** the 2s hard-seek drift-correction threshold was
-lowered to 500ms. Drift-corrected seeks are visible as brief
-hitches on drifting cameras, but in normal operation all cameras
-track the master closely enough that the threshold rarely fires.
-A 500ms hitch every minute or two under pathological conditions
-is acceptable; invisible 2s UI/pixel desync is not.
-
-### `?test_gap` dev hack
-
-The gap-skip path is hard to exercise in production — it requires
-a simultaneous outage across *every* camera, which is rare
-enough that the user couldn't reproduce it on demand. The main
-UI now accepts a URL parameter:
-
-```
-?debug=1&test_gap=14:30:00-14:35:00
-```
-
-During playback, `_pickClockMaster`, `_anyCamHasFootageAt`, and
-`_nextFootageAfter` pretend the selected day has no footage
-inside the given local-time window. Timeline rendering is
-unaffected (it reads `segments[]` directly), so the fake gap
-only shows up in the clock tick's decisions: the panels flash
-"Offline," a `gap_skip` event lands in `/api/debug/log`, and
-`wallTime` jumps to the window end. Verified end-to-end during
-the April 2026 rewrite.
-
-### Drift telemetry
-
-When `?debug=1` is on, the clock tick emits a `drift` event once
-per second with:
-
-- `clock_ms`: current `wallTime.getTime()`
-- `master`: index of the current clock master (null if none)
-- `spd`: playback speed
-- `cams`: per-camera state — `drift_ms`, `rs`, `p` (paused),
-  `vl` (videoLoading), `seg` (filename or null)
-
-`drift_ms` is `(video.currentTime - (wallTime - anchorMs) / 1000) * 1000`,
-reported as `null` when the camera has no `currentSegment`.
-(Earlier versions of the telemetry omitted the
-`currentSegment` gate and reported stale-anchor garbage like
-`drift_ms: 6131725` for cameras in a gap — fixed.)
-
-A `gap_skip` event is emitted inline whenever the known-gap
-branch fires:
-
-```json
-{"kind":"gap_skip","from_ms":...,"to_ms":...,"span_ms":...}
-```
+This replaced an earlier static "camera 0 is always master"
+design that broke in two ways: (1) scrub-into-gap snap-back — if
+cam 0 had no footage at the target, the clock kept reading its
+stale segment's `currentTime` and snapped `wallTime` backward;
+(2) cam-0-offline killed playback — free-running `wallTime`
+drifted past cameras 1–3 and their drift correction visibly
+jerked back every few seconds for the entire outage. Dynamic
+master selection fixes both.
 
 ### Do not re-litigate
 
 - **Don't make camera 0 the master again.** The asymmetry was
-  the bug. Dynamic selection with hysteresis is the fix.
-- **Don't try PI-controlled `playbackRate` on Safari.** See the
-  rate-test results above. If a future WebKit build fixes this,
-  re-run a test harness before building any control loop.
+  the bug.
+- **Don't try PI-controlled `playbackRate` on Safari.** The
+  expert recommendation for multi-stream sync is a PI controller
+  on `video.playbackRate` (small trims like `playbackRate = 1.02`
+  instead of visible seeks). Shaka Player and Chromecast
+  multi-room do this. Tested via `static/rate_test.html`
+  (reachable at `/rate_test.html` with `?debug=1`-style
+  auto-report to `/api/debug/log`) against real segments on
+  Safari 26.3.1 / WebKit 605.1.15. Effective rates were
+  incoherent: didn't track targets, didn't scale linearly, and
+  one test reported `currentTime` going **backwards** over 8
+  seconds of wall time. The same harness on Chrome and Firefox
+  honored every rate cleanly, so it's a WebKit limitation, not a
+  harness bug. Safari is the only target browser, so the idea
+  was abandoned. Keep `rate_test.html` around — if a future
+  WebKit build changes this, re-run before proposing any control
+  loop. Until then, the 500ms hard-seek is the drift mechanism.
 - **Don't remove the `!found`-narrow-grace (2s past segEnd).** It
-  exists so brief ffmpeg rotation hitches don't clear a camera's
-  `currentSegment` and kick it out of master eligibility — without
-  it, every minute-boundary rotation would cause a master
-  handoff.
-- **Don't use pure free-running `wallTime` (Option B).** The
-  "clock matches pixels" invariant breaks during any video stall.
+  keeps brief ffmpeg rotation hitches from clearing a camera's
+  `currentSegment` and kicking it out of master eligibility —
+  without it, every minute boundary would cause a handoff.
+- **Don't use pure free-running `wallTime`.** A "wallTime is
+  authoritative, videos drift-correct toward it" design was
+  considered and rejected — the invariant breaks during any
+  video stall.
 - **Don't synthesize fake video for gaps on the backend.** The
-  segment list is already the ground truth for "what footage
-  exists"; the clock tick can just skip through known gaps. Disk
-  synthesis was considered and rejected as needless complexity.
+  segment list is already ground truth; the clock tick skips
+  through known gaps. Disk synthesis is needless complexity.
+
+### `?test_gap` dev hack
+
+The gap-skip path is hard to exercise in production — it requires
+a simultaneous outage across *every* camera. The main UI accepts
+`?debug=1&test_gap=14:30:00-14:35:00`, which makes
+`_pickClockMaster`, `_anyCamHasFootageAt`, and `_nextFootageAfter`
+pretend the selected day has no footage inside the local-time
+window. Timeline rendering is unaffected; only the clock tick
+sees the fake gap, so the panels flash "Offline", a `gap_skip`
+event lands in `/api/debug/log`, and `wallTime` jumps to the
+window end.
+
+### Diagnostic infrastructure
+
+`?debug=1` on any URL turns on frontend instrumentation that
+posts events to `/api/debug/log` (newline-delimited JSON). Events
+include every `<video>` lifecycle event, every
+`loadSegmentForCamera` call, MSE `append-error`, a per-second
+`drift` event with per-camera `drift_ms` / readyState / loading
+state, and the `gap_skip` event from the clock tick.
+`curl https://nvr.example.com/api/debug/log` to read,
+`curl -X DELETE` to clear. Zero cost when `?debug=1` is not on
+the URL.

@@ -3,7 +3,7 @@
 A tiny, self-hosted NVR for people with minimal NVR needs.
 
 All I wanted was to record my four RTSP streams to disk and provide a basic
-2x2 time-synced playback screen. I didn't need AI, motion detected, transcoding, none of that. I looked at a few other NVRs (Frigate, LightNVR, Viseron), but none fit the bill. At best, they had a ton of features I didn't want and had to figure out how disable. But even in "record-only" mode, I either couldn't get them to work  (Viseron), or they insisted on running an `ffmpeg` transcoding process to produce  smaller streams (Frigate), or they didn't have a grid-play back screen for anything but live view (LightNVR).
+2x2 time-synced playback screen. I didn't need AI, motion detection, transcoding, none of that. I looked at a few other NVRs (Frigate, LightNVR, Viseron), but none fit the bill. At best, they had a ton of features I didn't want and had to figure out how to disable. But even in "record-only" mode, I either couldn't get them to work (Viseron), or they insisted on running an `ffmpeg` transcoding process to produce smaller streams (Frigate), or they didn't have a grid-play back screen for anything but live view (LightNVR).
 
 So I worked with Claude to write this NVR and frontend UI. All it does on the recording side is run `ffmpeg` pointed at RTSP streams to save footage to disk in one minute mp4 segments. The RTSP streams must already be in the correct format (H.264+AAC). Individual camera recording can be enabled/disabled via HTTP POST request.
 
@@ -66,7 +66,7 @@ curl -X POST http://tinynvr:8554/api/webhook/living-room \
 # Build and export OCI image to `tinynvr.tar`:
 make image
 
-# Build and run OCE image:
+# Build and run OCI image:
 make run
 ```
 
