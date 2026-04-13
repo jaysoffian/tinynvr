@@ -1,25 +1,35 @@
 """Retention management for recorded segments."""
 
 import asyncio
+import contextlib
 import logging
-from datetime import UTC, date, datetime, timedelta
+import re
+import shutil
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+
+from tinynvr import db
 
 logger = logging.getLogger(__name__)
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
-    """Delete .mp4 and .idx files older than retention_days.
+    """Delete expired hour dirs and their corresponding DB rows.
 
-    Segments are deleted by start-time (rolling window): an ``.mp4``
-    whose ``YYYY-MM-DD_HH-MM-SS`` stem resolves to a UTC datetime older
-    than ``now - retention_days`` is removed. Daily ``.idx`` files are
-    deleted one full UTC day later, so an index outlives the last
-    segment it references — stale in-flight entries are harmless
-    because list_segments ignores missing files and download_range
-    stat-checks before handing paths to ffmpeg.
+    The disk layout is ``{storage}/YYYY-MM-DD/HH/<camera>/MM-SS.mp4``.
+    An hour dir is "expired" when its wall-clock end
+    (``hour_start + 1h``) is already older than ``now - retention_days``.
+    Entire hour dirs are removed with ``rmtree`` — one call per hour per
+    camera — then the DB rows for segments before the retention cutoff
+    are dropped in a single ``DELETE``.
 
-    Returns the number of .mp4 files deleted.
+    The current and next wall-clock hour are never touched, so active
+    recorders can't have their working directory yanked out from under
+    them.
+
+    Returns the number of DB rows deleted.
     """
     root = Path(storage_path)
     if not root.exists():
@@ -27,38 +37,51 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
 
     now = datetime.now(tz=UTC)
     cutoff = now - timedelta(days=retention_days)
-    idx_cutoff = (now - timedelta(days=retention_days + 1)).date()
-    deleted = 0
 
-    for camera_dir in root.iterdir():
-        if not camera_dir.is_dir():
+    deleted_hours = 0
+    for date_dir in sorted(root.iterdir()):
+        if not date_dir.is_dir() or not _DATE_RE.match(date_dir.name):
             continue
-        for entry in camera_dir.iterdir():
-            if not entry.is_file():
+        try:
+            d = date.fromisoformat(date_dir.name)
+        except ValueError:
+            continue
+        for hour_dir in sorted(date_dir.iterdir()):
+            if not hour_dir.is_dir() or not hour_dir.name.isdigit():
                 continue
-            if entry.suffix == ".mp4":
+            try:
+                hour_ts = datetime.combine(
+                    d,
+                    time(int(hour_dir.name)),
+                    tzinfo=UTC,
+                )
+            except ValueError:
+                continue
+            if hour_ts + timedelta(hours=1) <= cutoff:
                 try:
-                    ts = datetime.strptime(entry.stem, "%Y-%m-%d_%H-%M-%S").replace(
-                        tzinfo=UTC
-                    )
-                except ValueError:
+                    shutil.rmtree(hour_dir)
+                except OSError as exc:
+                    logger.warning("Failed to rmtree %s: %s", hour_dir, exc)
                     continue
-                if ts < cutoff:
-                    entry.unlink()
-                    deleted += 1
-                    logger.debug("Deleted old segment: %s", entry)
-            elif entry.suffix == ".idx":
-                try:
-                    file_date = date.fromisoformat(entry.stem)
-                except ValueError:
-                    continue
-                if file_date < idx_cutoff:
-                    entry.unlink()
-                    logger.debug("Deleted old index: %s", entry)
+                deleted_hours += 1
+                logger.debug("Removed expired hour dir: %s", hour_dir)
+        # Drop the date dir if it's now empty.
+        with contextlib.suppress(OSError):
+            date_dir.rmdir()
 
-    if deleted > 0:
-        logger.info("Retention cleanup: deleted %d segment(s)", deleted)
-    return deleted
+    # Align the DB cutoff to the hour so row deletion stays in lockstep
+    # with the rmtree gate above: a row is dropped iff its hour dir has
+    # already been removed from disk.
+    cutoff_hour = cutoff.replace(minute=0, second=0, microsecond=0)
+    cutoff_utc = int(cutoff_hour.timestamp())
+    deleted_rows = db.delete_segments_before(cutoff_utc)
+    if deleted_hours or deleted_rows:
+        logger.info(
+            "Retention: removed %d hour dir(s), %d db row(s)",
+            deleted_hours,
+            deleted_rows,
+        )
+    return deleted_rows
 
 
 async def retention_loop(storage_path: str, retention_days: int) -> None:

@@ -19,35 +19,54 @@ a local NAS, not for multi-tenant or cloud deployment.
 
 ```
 {storage.path}/
-  {camera-name}/
-    2026-04-11_00-00-00.mp4
-    2026-04-11_00-01-00.mp4
+  tinynvr.db           # SQLite segment index (WAL mode)
+  tinynvr.db-wal
+  tinynvr.db-shm
+  2026-04-13/
+    04/
+      front-door/
+        26-56.mp4
+        27-02.mp4
+        ...
+      kitchen/
+        26-56.mp4
+        ...
+    05/
+      front-door/
+        ...
+  2026-04-14/
     ...
-    2026-04-11.idx
-    2026-04-12.idx
 ```
 
-- Flat per-camera directories — no day subdirs, no hour subdirs. At
-  1-minute segments and 4 cameras that's ~5,800 files/day, which
-  modern filesystems don't care about.
-- Segments are named by their UTC start time: `YYYY-MM-DD_HH-MM-SS.mp4`.
-- Daily `.idx` files are append-only text, one line per segment:
-  `filename: duration_sec`. Last entry wins on duplicate filenames.
+- **Date-first, hour-bucketed.** Frigate-style layout: segments are
+  grouped first by UTC date, then by hour, then by camera, then
+  minute-second leaf files. The single biggest benefit is retention:
+  an expired hour is one `shutil.rmtree` call per camera instead of
+  ~60 per-file `unlink`s.
+- Segment start time is fully encoded in the path components:
+  `YYYY-MM-DD/HH/<camera>/MM-SS.mp4`. `_parse_segment_path` in
+  `recorder.py` reconstructs the UTC start time from the path.
 - `.mp4` files are **self-contained** MP4 with `moov` at the front
   (ffmpeg `-segment_format mp4 -segment_format_options movflags=+faststart`).
   This is load-bearing — see "Why not HLS?" and "Playback" below.
+- The SQLite DB at `{storage.path}/tinynvr.db` is the segment index —
+  one row per segment with `(camera, start_utc, duration_ms,
+  size_bytes)`. It is the source of truth for all read paths
+  (`list_segments`, `download_range`, `recordings_range`); the
+  filesystem is only walked by `_validate_segments` at recorder
+  startup to catch segments left by a prior crash.
 
 ## Recording pipeline
 
 `tinynvr/recorder.py` runs one ffmpeg subprocess per enabled camera:
 
 ```
-ffmpeg -rtsp_transport tcp -use_wallclock_as_timestamps 1 -i <rtsp> \
+ffmpeg -rtsp_transport tcp -timeout 30000000 -i <rtsp> \
   -c copy \
   -f segment -segment_time 60 -reset_timestamps 1 \
   -segment_format mp4 -segment_format_options movflags=+faststart \
   -segment_atclocktime 1 -strftime 1 \
-  {camera}/%Y-%m-%d_%H-%M-%S.mp4
+  {storage}/%Y-%m-%d/%H/{camera}/%M-%S.mp4
 ```
 
 - **Nothing is ever transcoded** (`-c copy`). go2rtc is the upstream
@@ -86,13 +105,36 @@ ffmpeg -rtsp_transport tcp -use_wallclock_as_timestamps 1 -i <rtsp> \
   filesystem and ffprobe overhead, which isn't worth the
   playback-latency or data-loss cost.
 
-After each segment closes, an inotify `IN_CLOSE_WRITE` watcher on
-the camera dir dispatches a duration-index task that runs `ffprobe`
-on the file and appends `filename: duration_sec` to the day's
-`.idx`. Failed probes delete the segment and record `0` in the
-index so we don't retry. On recorder start, `validate_indexes`
-sweeps any `.mp4` files missing from `.idx` (from a prior crash)
-and probes them.
+**Pre-creating leaf directories.** ffmpeg's segment muxer cannot
+create intermediate directories from its strftime output pattern
+(`-strftime_mkdir 1` exists only on a different muxer we don't use).
+Each recorder runs a small `_dir_precreate_loop` that `mkdir -p`s
+the current and next hour's leaf dir (`{storage}/YYYY-MM-DD/HH/<camera>/`),
+waking ~30 seconds before each wall-clock hour boundary. `_spawn`
+also pre-creates them synchronously before launching ffmpeg, so the
+very first segment has a home.
+
+**Indexing.** A single application-wide `SegmentWatcher` runs one
+inotify instance for the whole storage tree. On startup it walks
+every existing leaf dir and adds a `CLOSE_WRITE` watch; new leaf
+dirs get a watch added by `_dir_precreate_loop` as it creates them.
+When retention `rmtree`s an old hour dir, the kernel drops those
+watches automatically via `IN_IGNORED`. The watch count is bounded
+by `num_cameras × num_existing_hour_dirs`, well under the kernel's
+default watch limit.
+
+When a `.mp4` closes, the watcher parses `(camera, start_utc)`
+from the path, looks up the matching recorder, and dispatches
+`CameraRecorder.index_segment`. That runs `ffprobe` and inserts a
+row into `segments` via `db.insert_segment`. Failed probes delete
+the segment on disk and never get a row — there is no
+"duration 0" sentinel.
+
+On recorder start, `_validate_segments` walks
+`{storage}/*/*/{camera}/*.mp4`, finds segments whose `start_utc` is
+not in the DB (crashed probe-before-insert, SIGKILL, lost inotify
+event), and re-probes them in parallel with a semaphore.
+`INSERT OR REPLACE` makes recovery idempotent.
 
 ## Playback pipeline
 
@@ -199,19 +241,29 @@ failed, and the trade-offs of the current MSE approach.
 
 ## Retention
 
-`tinynvr/retention.py` runs hourly and deletes `.mp4` files whose
-start time (parsed from the filename) is older than `now -
-retention_days`. This is a **rolling window**, not a whole-day
-drop: at any given tick up to ~60 segments per camera age out (one
-per minute since the last tick) rather than an entire UTC day
-disappearing at midnight UTC.
+`tinynvr/retention.py` runs hourly. The unit of deletion is a whole
+**hour directory**: when an hour dir's wall-clock end
+(`hour_start + 1h`) is already older than `now - retention_days`,
+the entire `{storage}/YYYY-MM-DD/HH/` subtree is removed with a
+single `shutil.rmtree`, dropping every camera's segments for that
+hour in one call instead of per-file `unlink`s. Empty date dirs are
+`rmdir`ed opportunistically on the same pass.
 
-Daily `.idx` files get a one-day grace period — they're deleted
-when their UTC date is more than `retention_days + 1` days old —
-so an index outlives the last segment it references. Briefly stale
-`.idx` entries are invisible to `list_segments` (which silently
-skips entries whose `stat()` fails) and to `download_range` (which
-`is_file()` -checks before handing paths to ffmpeg's concat demuxer).
+After the rmtree pass, the DB is pruned with a single
+`DELETE FROM segments WHERE start_utc < ?`. The cutoff is
+**hour-aligned** (`cutoff.replace(minute=0, second=0, microsecond=0)`)
+so row deletion stays in lockstep with disk deletion: a row is
+dropped iff the hour dir holding its file has already been
+removed. Without alignment, rows inside the still-alive
+most-recent hour would get dropped prematurely and their segments
+would disappear from `list_segments` until the next recorder
+restart's `_validate_segments` sweep.
+
+Retention never touches the current or next wall-clock hour, so
+active recorders can't have their working directory yanked out
+from under them. With `retention_days >= 1` and a 60-minute loop,
+we're only deleting hours that are days old — no conflict with
+`_dir_precreate_loop` or `SegmentWatcher`.
 
 ## Download-range endpoint
 

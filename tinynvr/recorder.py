@@ -6,13 +6,15 @@ import logging
 import os
 import signal
 import time
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
 from asyncinotify import Inotify, Mask
 
+from tinynvr import db
 from tinynvr.config import CameraConfig, Config, StorageConfig, save_config
-from tinynvr.duration import append_duration, validate_indexes
+from tinynvr.probe import probe_duration, unlink_unplayable
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,111 @@ class CameraState(StrEnum):
     ERROR = "error"
 
 
+def _parse_segment_path(
+    path: Path,
+    storage_root: Path,
+) -> tuple[str, int] | None:
+    """Parse ``{root}/YYYY-MM-DD/HH/<camera>/MM-SS.mp4`` → ``(camera, start_utc)``."""
+    try:
+        rel = path.relative_to(storage_root)
+    except ValueError:
+        return None
+    parts = rel.parts
+    if len(parts) != 4 or not parts[3].endswith(".mp4"):
+        return None
+    date_str, hour_str, camera, filename = parts
+    stem = filename.removesuffix(".mp4")
+    try:
+        ts = datetime(
+            year=int(date_str[0:4]),
+            month=int(date_str[5:7]),
+            day=int(date_str[8:10]),
+            hour=int(hour_str),
+            minute=int(stem[0:2]),
+            second=int(stem[3:5]),
+            tzinfo=UTC,
+        )
+    except ValueError, IndexError:
+        return None
+    return camera, int(ts.timestamp())
+
+
+class SegmentWatcher:
+    """Single application-wide inotify watcher for the storage tree.
+
+    Inotify is per-directory, not recursive, so we walk the existing
+    ``{storage}/YYYY-MM-DD/HH/<camera>/`` leaf dirs on start and add
+    a ``CLOSE_WRITE`` watch on each. New leaf dirs are handed to
+    :meth:`add_watch` by :meth:`CameraRecorder._dir_precreate_loop` as
+    they are created. Retention's ``rmtree`` drops watches implicitly
+    via ``IN_IGNORED``, which asyncinotify handles cleanly.
+    """
+
+    def __init__(
+        self,
+        storage_root: Path,
+        dispatch,
+    ) -> None:
+        self.storage_root = storage_root
+        self._dispatch = dispatch  # async (camera, start_utc, path) -> None
+        self._inotify: Inotify | None = None
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._inotify is not None:
+            return
+        self._inotify = Inotify()
+        if self.storage_root.is_dir():
+            for leaf in self.storage_root.glob("*/*/*"):
+                if leaf.is_dir():
+                    self._add_watch_raw(leaf)
+        self._task = asyncio.create_task(self._loop())
+
+    def add_watch(self, leaf_dir: Path) -> None:
+        if self._inotify is None:
+            return
+        self._add_watch_raw(leaf_dir)
+
+    def _add_watch_raw(self, leaf_dir: Path) -> None:
+        assert self._inotify is not None
+        try:
+            self._inotify.add_watch(leaf_dir, Mask.CLOSE_WRITE)
+        except OSError as exc:
+            logger.warning("Failed to add inotify watch on %s: %s", leaf_dir, exc)
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._inotify is not None:
+            self._inotify.close()
+            self._inotify = None
+
+    async def _loop(self) -> None:
+        assert self._inotify is not None
+        pending: set[asyncio.Task[None]] = set()
+        try:
+            async for event in self._inotify:
+                path = event.path
+                if path is None or path.suffix != ".mp4":
+                    continue
+                parsed = _parse_segment_path(path, self.storage_root)
+                if parsed is None:
+                    continue
+                camera, start_utc = parsed
+                task = asyncio.create_task(self._dispatch(camera, start_utc, path))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+        except asyncio.CancelledError:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        except Exception:
+            logger.exception("Segment watcher failed")
+
+
 class CameraRecorder:
     """Manages a single ffmpeg subprocess for one camera."""
 
@@ -34,24 +141,38 @@ class CameraRecorder:
         name: str,
         camera: CameraConfig,
         storage: StorageConfig,
+        watcher: SegmentWatcher,
     ) -> None:
         self.name = name
         self.camera = camera
         self.storage = storage
+        self._watcher = watcher
         self.state = CameraState.STOPPED
         self.last_error: str | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._monitor_task: asyncio.Task | None = None
-        self._watcher_task: asyncio.Task | None = None
+        self._precreate_task: asyncio.Task | None = None
         self._should_run = False
         self._backoff = 1.0
 
     @property
-    def output_dir(self) -> Path:
-        return Path(self.storage.path) / self.name
+    def storage_root(self) -> Path:
+        return Path(self.storage.path)
+
+    def _hour_dir(self, ts: datetime) -> Path:
+        return (
+            self.storage_root / ts.strftime("%Y-%m-%d") / ts.strftime("%H") / self.name
+        )
+
+    def _ensure_hour_dir(self, ts: datetime) -> Path:
+        leaf = self._hour_dir(ts)
+        leaf.mkdir(parents=True, exist_ok=True)
+        return leaf
 
     def _build_ffmpeg_args(self) -> list[str]:
-        output_pattern = str(self.output_dir / "%Y-%m-%d_%H-%M-%S.mp4")
+        output_pattern = str(
+            self.storage_root / "%Y-%m-%d" / "%H" / self.name / "%M-%S.mp4"
+        )
         return [
             "ffmpeg",
             "-hide_banner",
@@ -90,36 +211,36 @@ class CameraRecorder:
             return
         self._should_run = True
         self._backoff = 1.0
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        await validate_indexes(self.output_dir)
-        self._watcher_task = asyncio.create_task(self._watcher_loop())
+        # Pre-create the current and next hour dirs, and register
+        # watches on them, before ffmpeg can try to open a file.
+        now = datetime.now(tz=UTC)
+        self._watcher.add_watch(self._ensure_hour_dir(now))
+        self._watcher.add_watch(self._ensure_hour_dir(now + timedelta(hours=1)))
+        await self._validate_segments()
+        self._precreate_task = asyncio.create_task(self._dir_precreate_loop())
         self._monitor_task = asyncio.create_task(self._monitor())
 
     async def stop(self) -> None:
         """Stop recording this camera."""
         self._should_run = False
-        if self._monitor_task:
+        if self._monitor_task is not None:
             self._monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._monitor_task
             self._monitor_task = None
         await self._kill_process()
-        if self._watcher_task:
-            # Give the watcher a tick to pick up the IN_CLOSE_WRITE for
-            # ffmpeg's final segment and dispatch its append task before
-            # we cancel. Any append already in flight is drained by the
-            # watcher's CancelledError handler; anything missed is still
-            # recovered by validate_indexes() on the next start().
-            await asyncio.sleep(0.05)
-            self._watcher_task.cancel()
+        if self._precreate_task is not None:
+            self._precreate_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._watcher_task
-            self._watcher_task = None
+                await self._precreate_task
+            self._precreate_task = None
         self.state = CameraState.STOPPED
 
     async def _spawn(self) -> None:
         """Spawn the ffmpeg process."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(tz=UTC)
+        self._watcher.add_watch(self._ensure_hour_dir(now))
+        self._watcher.add_watch(self._ensure_hour_dir(now + timedelta(hours=1)))
         args = self._build_ffmpeg_args()
         logger.info("Starting ffmpeg for %s", self.name)
         self.state = CameraState.STARTING
@@ -132,47 +253,103 @@ class CameraRecorder:
         )
         self.state = CameraState.RECORDING
 
-    async def _index_segment(self, segment: Path) -> None:
+    async def _dir_precreate_loop(self) -> None:
+        """Ensure current + next hour dirs exist, aligned to hour boundaries."""
         try:
-            dur = await append_duration(self.output_dir, segment)
+            while self._should_run:
+                now = datetime.now(tz=UTC)
+                self._watcher.add_watch(self._ensure_hour_dir(now))
+                next_ts = now + timedelta(hours=1)
+                self._watcher.add_watch(self._ensure_hour_dir(next_ts))
+                next_boundary = next_ts.replace(minute=0, second=0, microsecond=0)
+                sleep_for = (next_boundary - now).total_seconds() - 30
+                await asyncio.sleep(max(1.0, sleep_for))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Dir precreate loop for %s failed", self.name)
+
+    async def index_segment(self, start_utc: int, segment: Path) -> None:
+        """Probe one closed segment and record it in the DB.
+
+        Called from :class:`SegmentWatcher` when an ``IN_CLOSE_WRITE``
+        event fires for a ``.mp4`` under this camera's tree.
+        """
+        try:
+            dur = await probe_duration(segment)
+            if dur is None:
+                unlink_unplayable(segment)
+                return
+            try:
+                size = segment.stat().st_size
+            except OSError as exc:
+                logger.warning("stat failed for %s: %s", segment, exc)
+                return
+            db.insert_segment(
+                camera=self.name,
+                start_utc=start_utc,
+                duration_ms=round(dur * 1000),
+                size_bytes=size,
+            )
+            logger.info("Indexed %s for %s (%.1fs)", segment.name, self.name, dur)
         except Exception:
             logger.exception(
                 "Failed to index segment %s for %s", segment.name, self.name
             )
-            return
-        if dur is not None:
-            logger.info("Indexed %s for %s (%.1fs)", segment.name, self.name, dur)
 
-    async def _watcher_loop(self) -> None:
-        """Append each finished segment's duration to its daily .idx file.
+    async def _validate_segments(self) -> None:
+        """Probe any on-disk segments missing from the DB.
 
-        Driven by inotify ``IN_CLOSE_WRITE`` events, which fire whenever
-        ffmpeg closes a segment file — whether via normal rotation or
-        on process exit (clean, SIGTERM, SIGKILL, or crash).
-
-        Each event dispatches a detached append task so the iterator
-        isn't blocked on ffprobe and so :meth:`stop` can drain any
-        in-flight appends before cancelling the watcher.
+        One-shot sweep at startup to catch segments left by a prior
+        run where the inotify event was lost (e.g. crash, SIGKILL).
         """
-        pending: set[asyncio.Task[None]] = set()
-        try:
-            with Inotify() as inotify:
-                inotify.add_watch(self.output_dir, Mask.CLOSE_WRITE)
-                async for event in inotify:
-                    path = event.path
-                    if path is None or path.suffix != ".mp4":
-                        continue
-                    task = asyncio.create_task(
-                        self._index_segment(self.output_dir / path.name)
-                    )
-                    pending.add(task)
-                    task.add_done_callback(pending.discard)
-        except asyncio.CancelledError:
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            raise
-        except Exception:
-            logger.exception("Inotify watcher for %s failed", self.name)
+        storage_root = self.storage_root
+        if not storage_root.is_dir():
+            return
+
+        candidates: list[tuple[Path, int]] = []
+        for p in storage_root.glob(f"*/*/{self.name}/*.mp4"):
+            parsed = _parse_segment_path(p, storage_root)
+            if parsed is None:
+                continue
+            candidates.append((p, parsed[1]))
+        if not candidates:
+            return
+
+        known = db.known_start_utcs(
+            self.name,
+            day_start_utc=0,
+            day_end_utc=2**31 - 1,
+        )
+        to_probe = [(p, u) for p, u in candidates if u not in known]
+        if not to_probe:
+            return
+
+        logger.info(
+            "Validating %d unindexed segment(s) for %s",
+            len(to_probe),
+            self.name,
+        )
+        sem = asyncio.Semaphore(8)
+
+        async def _probe_one(p: Path, start_utc: int) -> None:
+            async with sem:
+                dur = await probe_duration(p)
+                if dur is None:
+                    unlink_unplayable(p)
+                    return
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    return
+                db.insert_segment(
+                    camera=self.name,
+                    start_utc=start_utc,
+                    duration_ms=round(dur * 1000),
+                    size_bytes=size,
+                )
+
+        await asyncio.gather(*(_probe_one(p, u) for p, u in to_probe))
 
     async def _kill_process(self) -> None:
         """Send SIGTERM, wait up to 5s, then SIGKILL."""
@@ -250,11 +427,15 @@ class CameraRecorder:
 
 
 class RecordingManager:
-    """Manages all CameraRecorder instances."""
+    """Manages all CameraRecorder instances and the shared SegmentWatcher."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.recorders: dict[str, CameraRecorder] = {}
+        self.watcher = SegmentWatcher(
+            Path(config.storage.path),
+            self._dispatch_segment,
+        )
         self._init_recorders()
 
     def _init_recorders(self) -> None:
@@ -263,19 +444,33 @@ class RecordingManager:
                 name=name,
                 camera=camera,
                 storage=self.config.storage,
+                watcher=self.watcher,
             )
+
+    async def _dispatch_segment(
+        self,
+        camera_name: str,
+        start_utc: int,
+        path: Path,
+    ) -> None:
+        recorder = self.recorders.get(camera_name)
+        if recorder is None:
+            return
+        await recorder.index_segment(start_utc, path)
 
     async def start_all(self) -> None:
         """Start recorders for all enabled cameras."""
+        self.watcher.start()
         for name, recorder in self.recorders.items():
             if recorder.camera.enabled:
                 logger.info("Starting recorder for %s", name)
                 await recorder.start()
 
     async def stop_all(self) -> None:
-        """Stop all recorders."""
+        """Stop all recorders and the watcher."""
         for recorder in self.recorders.values():
             await recorder.stop()
+        await self.watcher.stop()
 
     async def enable_camera(self, name: str) -> None:
         """Enable a camera and start recording."""

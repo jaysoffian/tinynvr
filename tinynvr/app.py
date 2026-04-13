@@ -9,7 +9,7 @@ import re
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,13 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, PlainTextResponse, StreamingResponse
 
+from tinynvr import db
 from tinynvr.config import (
     Config,
     config_to_dict,
     load_config,
     save_config,
 )
-from tinynvr.duration import read_index, read_indexes
 from tinynvr.recorder import RecordingManager
 from tinynvr.retention import retention_loop
 
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage startup and shutdown of recording and retention."""
     config = load_config()
+    db.init_db(config.storage.path)
     manager = RecordingManager(config)
     retention_task = asyncio.create_task(
         retention_loop(config.storage.path, config.storage.retention_days),
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     retention_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await retention_task
+    db.close_db()
     logger.info("TinyNVR shutdown complete")
 
 
@@ -162,19 +164,11 @@ async def recordings_range(request: Request) -> dict:
 
     The date is a UTC ``YYYY-MM-DD`` string, or ``None`` if nothing is indexed.
     """
-    config: Config = request.app.state.config
-    storage = Path(config.storage.path)
-    if not storage.is_dir():
+    _ = request  # kept for API symmetry
+    start_utc = db.earliest_start_utc()
+    if start_utc is None:
         return {"earliest": None}
-
-    earliest: str | None = None
-    for camera_dir in storage.iterdir():
-        if not camera_dir.is_dir():
-            continue
-        for idx_file in camera_dir.glob("*.idx"):
-            date_str = idx_file.stem
-            if earliest is None or date_str < earliest:
-                earliest = date_str
+    earliest = datetime.fromtimestamp(start_utc, tz=UTC).date().isoformat()
     return {"earliest": earliest}
 
 
@@ -228,44 +222,42 @@ async def list_segments(name: str, date_str: str, request: Request) -> list[dict
         raise HTTPException(status_code=404, detail=f"Camera '{name}' not found")
 
     try:
-        date.fromisoformat(date_str)
+        day = date.fromisoformat(date_str)
     except ValueError:
         raise HTTPException(
             status_code=400,
             detail="Invalid date format, expected YYYY-MM-DD",
         ) from None
 
-    # The recorder owns the daily .idx file and is the sole writer.
-    # Until the recorder has indexed a day, we return nothing for it.
-    camera_dir = Path(config.storage.path) / name
-    durations = read_index(camera_dir, date_str)
+    day_start = int(datetime.combine(day, datetime.min.time(), tzinfo=UTC).timestamp())
+    day_end = day_start + 86400
+
+    rows = db.list_segments_for_day(name, day_start, day_end)
 
     segments = []
-    for filename, duration_sec in sorted(durations.items()):
-        if not filename.endswith(".mp4"):
-            continue
-        try:
-            start_time = (
-                datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S")
-                .replace(tzinfo=UTC)
-                .isoformat()
-            )
-        except ValueError:
-            continue
-        try:
-            size_bytes = (camera_dir / filename).stat().st_size
-        except OSError:
-            continue
+    for start_utc, duration_ms, size_bytes in rows:
+        ts = datetime.fromtimestamp(start_utc, tz=UTC)
         segments.append(
             {
-                "filename": filename,
-                "start_time": start_time,
+                "filename": ts.strftime("%Y-%m-%d_%H-%M-%S.mp4"),
+                "start_time": ts.isoformat(),
                 "size_bytes": size_bytes,
-                "duration_sec": duration_sec,
+                "duration_sec": duration_ms / 1000.0,
             }
         )
 
     return segments
+
+
+def _segment_disk_path(storage: Path, camera_name: str, start_utc: int) -> Path:
+    ts = datetime.fromtimestamp(start_utc, tz=UTC)
+    return (
+        storage
+        / ts.strftime("%Y-%m-%d")
+        / ts.strftime("%H")
+        / camera_name
+        / ts.strftime("%M-%S.mp4")
+    )
 
 
 @app.get("/api/segments/{camera_name}/{filename}")
@@ -282,11 +274,18 @@ async def serve_segment(
     """
     config: Config = request.app.state.config
     storage = Path(config.storage.path).resolve()
-    file_path = (storage / camera_name / filename).resolve()
 
-    if not file_path.is_relative_to(storage) or not file_path.is_file():
+    if not filename.endswith(".mp4"):
         raise HTTPException(status_code=404, detail="Segment not found")
-    if file_path.suffix != ".mp4":
+    try:
+        ts = datetime.strptime(
+            filename.removesuffix(".mp4"), "%Y-%m-%d_%H-%M-%S"
+        ).replace(tzinfo=UTC)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Segment not found") from None
+
+    file_path = _segment_disk_path(storage, camera_name, int(ts.timestamp())).resolve()
+    if not file_path.is_relative_to(storage) or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Segment not found")
 
     return FileResponse(
@@ -326,53 +325,23 @@ async def download_range(
         raise HTTPException(status_code=400, detail="end must be after start")
 
     storage = Path(config.storage.path).resolve()
-    camera_dir = storage / name
 
-    # Read indexes for the UTC dates spanning the range (plus one day before,
-    # to catch a segment that started late on the prior day).
-    dates: list[str] = []
-    d = (start_dt - timedelta(days=1)).date()
-    end_date = end_dt.date()
-    while d <= end_date:
-        dates.append(d.isoformat())
-        d += timedelta(days=1)
-    durations = read_indexes(camera_dir, dates)
-
-    if not durations:
-        raise HTTPException(status_code=404, detail="No segments found")
-
-    # Find segments overlapping [start_dt, end_dt)
-    matching: list[tuple[datetime, Path, float]] = []
-    for filename, dur in sorted(durations.items()):
-        if dur <= 0:
-            continue
-        if not filename.endswith(".mp4"):
-            continue
-        p = camera_dir / filename
-        if not p.resolve().is_relative_to(storage):
-            continue
-        if not p.is_file():
-            # Under rolling retention, an .idx can briefly reference a
-            # .mp4 that's already been deleted. Skip silently.
-            continue
-        try:
-            ts = datetime.strptime(Path(filename).stem, "%Y-%m-%d_%H-%M-%S").replace(
-                tzinfo=UTC
-            )
-        except ValueError:
-            continue
-        seg_end = ts.timestamp() + dur
-        if seg_end <= start_dt.timestamp():
-            continue
-        if ts.timestamp() >= end_dt.timestamp():
-            continue
-        matching.append((ts, p, dur))
-
-    if not matching:
+    rows = db.list_segments_for_range(
+        name,
+        int(start_dt.timestamp()),
+        int(end_dt.timestamp()),
+    )
+    if not rows:
         raise HTTPException(
             status_code=404,
             detail="No segments overlap the requested range",
         )
+
+    matching: list[tuple[datetime, Path, float]] = []
+    for start_utc, duration_ms, _size in rows:
+        ts = datetime.fromtimestamp(start_utc, tz=UTC)
+        p = _segment_disk_path(storage, name, start_utc)
+        matching.append((ts, p, duration_ms / 1000.0))
 
     # Calculate trim offsets
     first_start = matching[0][0].timestamp()
