@@ -742,6 +742,10 @@ function nvr() {
       }
 
       state.videoLoading = true;
+      // Freeze wallTime briefly while the fresh load settles so the
+      // clock doesn't race ahead of the cameras and push drift
+      // correction into a self-feeding seek loop. Mirrors _seekByKey.
+      this._seekUntil = performance.now() + 500;
 
       // Pause the video before flushing so it doesn't auto-play from
       // position 0 when new buffer data appears. Resume after seek.
