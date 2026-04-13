@@ -1,39 +1,22 @@
 # TinyNVR
 
-A lightweight, self-hosted NVR that records RTSP camera streams and provides a web UI for synced multi-camera playback with timeline scrubbing.
+A tiny, self-hosted NVR for people with minimal NVR needs.
 
-- Records via ffmpeg with no transcoding (`-c copy`)
-- 1-minute self-contained MP4 segments with `moov` at front for instant byte-range scrubbing
-- Synced multi-camera grid with a 24-hour timeline that handles DST transitions
-- Rolling retention (configurable, default 7 days)
-- Webhook to toggle cameras on/off
+All I wanted was to record my four RTSP streams to disk and provide a basic
+2x2 time-synced playback screen. I didn't need AI, motion detected, transcoding, none of that. I looked at a few other NVRs (Frigate, LightNVR, Viseron), but none fit the bill. At best, they had a ton of features I didn't want and had to figure out how disable. But even in "record-only" mode, I either couldn't get them to work  (Viseron), or they insisted on running an `ffmpeg` transcoding process to produce  smaller streams (Frigate), or they didn't have a grid-play back screen for anything but live view (LightNVR).
 
-See [DESIGN.md](DESIGN.md) for the full design, including the storage
-layout, recording/playback pipelines, and the reasoning against HLS.
+So I worked with Claude to write this NVR and frontend UI. All it does on the recording side is run `ffmpeg` pointed at RTSP streams to save footage to disk in one minute mp4 segments. The RTSP streams must already be in the correct format (H.264+AAC). Individual camera recording can be enabled/disabled via HTTP POST request.
+
+The frontend UI is a grid with synced timeline. You can select a time range for download. The mp4 segments are combined into a single file.
+
+The only browser I care about is Safari and it was tricky figuring out gapless playback. Chrome and Firefox probably work too, but I don't test with them. See [DESIGN.md](DESIGN.md) for the full design.
+
+The only deployment I care about is an OCI image.
 
 ## Requirements
 
-- Linux (uses inotify to index segments as ffmpeg finishes writing them)
-- **RTSP streams must be H.264 video + AAC audio.** The recorder is
-  pure stream copy (`-c copy`) and writes MP4 segments; anything
-  other than H.264+AAC will fail to mux. The expected deployment is
-  behind [go2rtc](https://github.com/AlexxIT/go2rtc) with its `?mp4`
-  stream variant, which normalizes camera streams to H.264+AAC for
-  you — point TinyNVR at the go2rtc RTSP URLs, not at the cameras
-  directly.
-
-## Quick start
-
-```bash
-git clone https://github.com/jaysoffian/tinynvr
-cd tinynvr
-mise install
-cp config.yaml.example config.yaml
-# Edit config.yaml with your RTSP URLs
-make run
-```
-
-The web UI is at http://localhost:8554.
+- A host capable of running an OCI image with enough storage for at least one day of recordings. I use [TrueNAS Scale](https://apps.truenas.com/managing-apps/installing-custom-apps/#installing-via-yaml-).
+- One or more RTSP streams in H.264 video + AAC audio format. I use [go2rtc](https://go2rtc.org) for my Kasa KC100 indoor cameras and [Scrypted](https://www.scrypted.app) with its rebroadcast plugin for my Reolink doorbell.
 
 ## Configuration
 
@@ -41,21 +24,27 @@ Copy `config.yaml.example` to `config.yaml` and edit:
 
 ```yaml
 storage:
-  path: ./recordings
+  path: /recordings
   retention_days: 7
 
 cameras:
-  front-door:
-    url: rtsp://your-camera:554/stream1
+  doorbell:
+    url: "rtsp://host:8554/doorbell?mp4"
     enabled: true
-  living-room:
-    url: rtsp://your-camera:554/stream2
+  dining-room:
+    url: "rtsp://host:8554/dining-room?mp4"
+    enabled: true
+  family-room:
+    url: "rtsp://host:8554/family-room?mp4"
+    enabled: true
+  kitchen:
+    url: "rtsp://host:8554/kitchen?mp4"
     enabled: true
 ```
 
 ## Webhook
 
-POST to `/api/webhook/{camera_name}` to toggle a camera on or off:
+POST to `/api/webhook/{camera_name}` to toggle recording for a camera on or off:
 
 ```bash
 # Disable a camera
@@ -69,38 +58,50 @@ curl -X POST http://tinynvr:8554/api/webhook/living-room \
   -d '{"enabled": true}'
 ```
 
-## Docker
+(This updates the `config.yaml` so that the camera enabled/disabled state survives restarts.)
+
+## Podman
 
 ```bash
-# Build (alpine:edge + uv-installed Python 3.14 + ffmpeg from edge)
+# Build and export OCI image to `tinynvr.tar`:
 make image
 
-# Run
-podman run -d \
-  -p 8554:8554 \
-  -v /path/to/recordings:/recordings \
-  -v /path/to/config-dir:/config \
-  tinynvr:latest
+# Build and run OCE image:
+make run
 ```
 
-`make image` stamps the short git SHA into `/app/VERSION` and the
-standard OCI image labels (`org.opencontainers.image.revision`,
-`.source`, `.title`). The running app reads `/app/VERSION` at startup
-and exposes it via `GET /api/version`; the web UI shows it as small
-dimmed text at the right edge of the topbar.
+The `/config` volume expects a directory containing `config.yaml`. The `/recordings` volume is the persistent segment store. Both must be writable.
 
-The `/config` volume expects a directory containing `config.yaml`
-(the container reads `TINYNVR_CONFIG=/config/config.yaml`). The
-`/recordings` volume is the persistent segment store.
+Sample compose file:
+
+```yaml
+services:
+  tinynvr:
+    container_name: tinynvr
+    hostname: tinynvr
+    image: localhost/tinynvr:latest
+    pull_policy: never
+    environment:
+      TZ: UTC
+    ports:
+      - "8554:8554"
+    user: "816:816"
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges
+    volumes:
+      - /mnt/pool0/nvr/config:/config
+      - /mnt/pool0/nvr/recordings:/recordings
+      - type: tmpfs
+        target: /tmp
+```
 
 ## Development
 
-Requires [mise](https://mise.jdx.dev) (installs uv and prek).
+Requires [mise-en-place](https://mise.jdx.dev) and [Podman](https://podman.io).
 
 ```bash
-mise install        # install uv and prek
-uv sync             # install Python dependencies
-prek install        # install git hooks
-make check          # run all linters (ruff, pyright)
-make run            # start dev server with reload
+make setup
+make check
 ```
