@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import signal
 import time
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 _SEGMENT_SECONDS = 60
 _probe_duration = partial(probe_duration, max_duration=_SEGMENT_SECONDS * 1.5)
+_SEGMENT_PATH_RE = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"/(?P<hour>\d{2})"
+    r"/(?P<camera>[^/]+)"
+    r"/(?P<minute>\d{2})-(?P<second>\d{2})\.mp4$"
+)
 
 
 class CameraState(StrEnum):
@@ -39,24 +46,22 @@ def _parse_segment_path(
         rel = path.relative_to(storage_root)
     except ValueError:
         return None
-    parts = rel.parts
-    if len(parts) != 4 or not parts[3].endswith(".mp4"):
+    m = _SEGMENT_PATH_RE.match(rel.as_posix())
+    if m is None:
         return None
-    date_str, hour_str, camera, filename = parts
-    stem = filename.removesuffix(".mp4")
     try:
         ts = datetime(
-            year=int(date_str[0:4]),
-            month=int(date_str[5:7]),
-            day=int(date_str[8:10]),
-            hour=int(hour_str),
-            minute=int(stem[0:2]),
-            second=int(stem[3:5]),
+            year=int(m["year"]),
+            month=int(m["month"]),
+            day=int(m["day"]),
+            hour=int(m["hour"]),
+            minute=int(m["minute"]),
+            second=int(m["second"]),
             tzinfo=UTC,
         )
-    except ValueError, IndexError:
+    except ValueError:
         return None
-    return camera, int(ts.timestamp())
+    return m["camera"], int(ts.timestamp())
 
 
 class SegmentWatcher:
