@@ -1387,19 +1387,36 @@ function nvr() {
       });
     },
 
-    segmentBlockStyle(seg) {
-      const start = this._parseStart(seg);
-      const sod = this._startOfDay();
-      const dayLen = this._dayLengthMs();
-      const left = ((start - sod) / dayLen) * 100;
-      let durMs;
-      if (seg.duration_sec > 0) {
-        durMs = seg.duration_sec * 1000;
-      } else {
-        // Active recording: extend to now, capped at segment duration
-        durMs = Math.min(Date.now() - start.getTime(), this._segmentDurationMs);
+    // Coalesce adjacent 1-minute segments into contiguous intervals so
+    // the timeline renders one div per recording run instead of one per
+    // minute. Dodges the subpixel-gap issue that plagues ~1px-wide
+    // blocks and massively cuts Alpine's reactive diff cost.
+    timelineIntervals(cam) {
+      const out = [];
+      for (const seg of this.timelineSegments(cam)) {
+        const start = this._parseStart(seg).getTime();
+        let end;
+        if (seg.duration_sec > 0) {
+          end = start + seg.duration_sec * 1000;
+        } else {
+          // Live segment: extend to now, capped at one segment's worth.
+          end = start + Math.min(Date.now() - start, this._segmentDurationMs);
+        }
+        const last = out[out.length - 1];
+        if (last && start <= last.end + 1000) {
+          last.end = Math.max(last.end, end);
+        } else {
+          out.push({ start, end });
+        }
       }
-      const width = (durMs / dayLen) * 100;
+      return out;
+    },
+
+    intervalBlockStyle(interval) {
+      const sod = this._startOfDay().getTime();
+      const dayLen = this._dayLengthMs();
+      const left = ((interval.start - sod) / dayLen) * 100;
+      const width = ((interval.end - interval.start) / dayLen) * 100;
       return `left:${left}%;width:${width}%`;
     },
 

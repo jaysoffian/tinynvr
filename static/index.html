@@ -757,8 +757,8 @@ html, body {
                 <div class="fs-play-divider"></div>
                 <div class="fs-timeline">
               <div class="fs-timeline-bar">
-                <template x-for="seg in timelineSegments(cam)" :key="'fs-'+seg.filename">
-                  <div class="fs-timeline-segment" :style="segmentBlockStyle(seg)"></div>
+                <template x-for="interval in timelineIntervals(cam)" :key="'fs-'+interval.start">
+                  <div class="fs-timeline-segment" :style="intervalBlockStyle(interval)"></div>
                 </template>
               </div>
               <div class="timeline-selection" x-show="selectionStart && selectionEnd" x-cloak
@@ -797,9 +797,9 @@ html, body {
           <div class="timeline-track">
             <span class="timeline-track-label" x-text="cam.name"></span>
             <div class="timeline-track-bar">
-              <template x-for="seg in timelineSegments(cam)" :key="seg.filename">
+              <template x-for="interval in timelineIntervals(cam)" :key="interval.start">
                 <div class="timeline-segment-block"
-                     :style="segmentBlockStyle(seg)"></div>
+                     :style="intervalBlockStyle(interval)"></div>
               </template>
             </div>
           </div>
