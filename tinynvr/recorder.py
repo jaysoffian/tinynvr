@@ -59,8 +59,6 @@ class CameraRecorder:
             "warning",
             "-rtsp_transport",
             "tcp",
-            "-use_wallclock_as_timestamps",
-            "1",
             "-timeout",
             "30000000",
             "-i",
