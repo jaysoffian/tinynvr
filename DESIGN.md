@@ -359,6 +359,89 @@ the full download completes).
 See **"Rejected playback approaches"** below for the approaches
 tried before MSE and why each failed.
 
+## Scrub preview sprites
+
+Hovering over the timeline pops up a per-camera preview of the
+moment under the cursor. Each camera renders one row showing a
+single thumbnail at native aspect ratio, and the cursor's
+sub-second position within the segment selects which of the 6
+pre-baked thumbnails is visible — Plex / Infuse style.
+
+**Sprite generation** (`tinynvr/sprite.py`). For each closed
+segment, ffmpeg samples 6 keyframes and tiles them into a single
+JPEG sibling of the source MP4 (`MM-SS.mp4` → `MM-SS.jpg`). The
+key flag is `-skip_frame:v nokey` placed *before* `-i`: the
+decoder only emits keyframes to the filter graph, so a 60-second
+segment with GOP=2 only decodes ~30 I-frames instead of ~1500
+total — ~99% CPU savings vs. a naive `fps=1/10` filter alone.
+Putting `-skip_frame:v nokey` after `-i` silently does nothing
+(ffmpeg treats it as an output option). Output is `tile=6x1`,
+`scale=400:-2`, `-qscale:v 2`. Each sprite is ~30–60 KB, so total
+sprite storage at 7-day retention is ~3% of video storage.
+
+Co-locating sprites with their source MP4 means retention's
+`shutil.rmtree({hour_dir})` cleans them up for free — no separate
+sweep, no DB rows, no schema change.
+
+**Generation.** The post-process hook in
+`CameraRecorder.index_segment` fires the sprite ffmpeg as a
+background task (`asyncio.create_task`, with the task stashed on
+the recorder so the GC doesn't drop it) right after the DB insert
+succeeds. Failures log a warning and never affect indexing. New
+segments are sprited within a second of being closed.
+
+For the one-time backfill of segments recorded before the feature
+shipped, run `uv run python -m tinynvr.sprite_backfill`. It walks
+the storage tree, generates any missing `.jpg` siblings 4-way
+parallel, and exits. Once that's done on a given deployment, the
+script (and `tinynvr/sprite_backfill.py`) can be deleted —
+post-process keeps everything sprited going forward.
+
+**Serving.** The existing `GET /api/segments/{camera}/{filename}`
+route is reused for sprite requests: a `.jpg` filename resolves to
+the sibling JPEG path and is served via `FileResponse`. There is
+no on-demand generation in the serving path — a missing sprite
+returns 404 and the frontend's `background-image` silently shows
+the row's `#000` background. Declaring a separate `{filename}.jpg`
+route wouldn't help here: FastAPI matches in declaration order
+and the existing `{filename}` catch-all would shadow it. Sprites
+are served with `Cache-Control: public, max-age=31536000,
+immutable` so the browser caches aggressively.
+
+**Frontend layout.** In the multi-camera grid view, the popover
+stacks one row per camera in `this.cameras` order, matching the
+playback grid mental model. In fullscreen single-camera view, only
+the focused camera's row is shown (and at a much larger thumb
+size, since the popover only has one row to spend its budget on).
+Both views render their own `.timeline-hover-preview` element —
+one inside the bottom timeline's cursor region, one inside each
+fullscreen overlay's `.fs-timeline` — but they share state via
+the same `hoverPreview` Alpine object.
+
+Each row shows the thumb whose index is
+`floor((cursorMs - segStartMs) / 10000)`, clamped to 0..5. The
+single tile is rendered by setting `background-image` to the
+sprite URL, `background-size` to `(6 * displayW) × displayH` (the
+full strip's display footprint), and `background-position` to
+`-idx * displayW` — the row's `width × height` box only exposes
+one tile of the underlying 6×1 sprite. Native frame dimensions
+come from `videoWidth` / `videoHeight` on the corresponding
+`<video>` element's first `loadedmetadata` event; until detected,
+a 16:9 fallback is used. Each tile is fit into a `(maxW, maxH)`
+box preserving aspect — `(280, 130)` in grid mode and `(480, 270)`
+in fullscreen — so 16:9, 4:3, and portrait cameras coexist
+sensibly in one popover.
+
+A memo key built from `(fullscreenIdx, camera, segment filename,
+thumb index)` for each rendered row short-circuits rebuilds on
+every mousemove — Alpine reactivity only fires when the user
+actually crosses a 10-second bucket boundary, a segment boundary,
+or toggles fullscreen.
+
+The currently-recording segment has no sprite (ffmpeg hasn't
+closed the source MP4 yet). The preview row is silently omitted —
+matches the existing 0-to-60s behind-live lag.
+
 ## Retention
 
 `tinynvr/retention.py` runs hourly. The unit of deletion is a whole

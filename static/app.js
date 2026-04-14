@@ -26,6 +26,8 @@ function nvr() {
     canGoForward: false,
     hoverPct: null, // 0-100 timeline position during hover, null when not hovering
     hoverTime: null, // Date at hover position
+    hoverPreview: { visible: false, rows: [] }, // sprite preview for the segment under the cursor
+    _hoverPreviewKey: "", // memo key — bail out of rebuild when segment-set unchanged
 
     // Opt-in debug instrumentation; enabled with ?debug=1 on the URL.
     // Captures video element events + load calls
@@ -572,6 +574,24 @@ function nvr() {
       } catch {}
     },
 
+    _initVideoEl(idx, video) {
+      // Stash native dimensions so the hover preview can render each
+      // camera's sprite row at the correct aspect ratio. Uses { once }
+      // so a SourceBuffer reset on day-change doesn't fire it again.
+      video.addEventListener(
+        "loadedmetadata",
+        () => {
+          const state = this.camStates[idx];
+          if (state) {
+            state.nativeWidth = video.videoWidth;
+            state.nativeHeight = video.videoHeight;
+          }
+        },
+        { once: true },
+      );
+      this._debugInstrumentVideo(idx, video);
+    },
+
     _debugInstrumentVideo(idx, video) {
       if (!this._debugEnabled) return;
       const events = [
@@ -650,6 +670,8 @@ function nvr() {
         audioInitAppended: false,
         objectUrl: null,
         fetchAbort: null, // AbortController for canceling stale fetches
+        nativeWidth: null, // captured on first loadedmetadata; used to size hover-preview rows
+        nativeHeight: null,
       };
     },
 
@@ -1464,6 +1486,101 @@ function nvr() {
       const frac = x / rect.width;
       this.hoverPct = frac * 100;
       this.hoverTime = new Date(this._startOfDay().getTime() + frac * this._dayLengthMs());
+      this._updateHoverPreview();
+    },
+
+    _updateHoverPreview() {
+      if (!this.hoverTime) {
+        if (this._hoverPreviewKey !== "") {
+          this._hoverPreviewKey = "";
+          this.hoverPreview = { visible: false, rows: [] };
+        }
+        return;
+      }
+      // In fullscreen, only the focused camera's preview is relevant.
+      // In grid mode, show every camera's row.
+      const indices =
+        this.fullscreenIdx !== null ? [this.fullscreenIdx] : this.cameras.map((_, i) => i);
+
+      // Resolve segment + thumb-index under cursor for each camera
+      // we'll render and build a memo key. The thumb index advances
+      // every 10s within a segment, so the key changes whenever the
+      // cursor crosses a thumb bucket (or a segment boundary). If
+      // nothing changed since the last call, bail out before
+      // rebuilding rows or triggering Alpine reactivity.
+      const founds = new Array(this.cameras.length).fill(null);
+      const thumbIdxs = new Array(this.cameras.length).fill(0);
+      const keyParts = [`fs:${this.fullscreenIdx ?? "none"}`];
+      for (const i of indices) {
+        const cam = this.cameras[i];
+        const found = this.findSegmentAt(cam.name, this.hoverTime);
+        founds[i] = found;
+        if (!found) {
+          keyParts.push(`${cam.name}:none`);
+          continue;
+        }
+        const segStart = this._parseStart(found.segment).getTime();
+        const offsetMs = this.hoverTime.getTime() - segStart;
+        // Sprite has 6 tiles at 10s intervals: 0..9.999s → 0,
+        // 10..19.999s → 1, ..., 50..59.999s → 5.
+        const idx = Math.max(0, Math.min(5, Math.floor(offsetMs / 10000)));
+        thumbIdxs[i] = idx;
+        keyParts.push(`${cam.name}:${found.segment.filename}:${idx}`);
+      }
+      const key = keyParts.join("|");
+      if (key === this._hoverPreviewKey) return;
+      this._hoverPreviewKey = key;
+
+      // Each row shows ONE thumb at the camera's native frame aspect.
+      // Fit the thumb into a (maxW, maxH) box preserving aspect, so
+      // 16:9, 4:3, and portrait cameras all coexist in one popover.
+      // Fullscreen has only one row so it can be much larger.
+      const maxW = this.fullscreenIdx !== null ? 480 : 280;
+      const maxH = this.fullscreenIdx !== null ? 270 : 130;
+      const rows = [];
+      for (const i of indices) {
+        const found = founds[i];
+        if (!found) continue;
+        const cam = this.cameras[i];
+        const state = this.camStates[i];
+        const nativeW = state?.nativeWidth || 16;
+        const nativeH = state?.nativeHeight || 9;
+        const ar = nativeW / nativeH;
+        let displayW = maxW;
+        let displayH = Math.round(maxW / ar);
+        if (displayH > maxH) {
+          displayH = maxH;
+          displayW = Math.round(maxH * ar);
+        }
+        // Render a single tile from the 6x1 strip by setting
+        // background-size to the full strip's display footprint
+        // (6 * displayW wide) and shifting background-position left
+        // by idx * displayW. The row's box only shows one thumb.
+        const idx = thumbIdxs[i];
+        const stripW = 6 * displayW;
+        const spriteUrl = this.segmentUrl(cam.name, found.segment).replace(/\.mp4$/, ".jpg");
+        rows.push({
+          cam: cam.name,
+          style: `width:${displayW}px;height:${displayH}px;background-image:url("${spriteUrl}");background-size:${stripW}px ${displayH}px;background-position:-${idx * displayW}px 0;`,
+        });
+      }
+      this.hoverPreview = { visible: rows.length > 0, rows };
+    },
+
+    get hoverPreviewStyle() {
+      if (!this.hoverPreview.visible || this.hoverPct == null) return "display:none";
+      // Center horizontally on the cursor, then clamp inside the cursor
+      // region (0..100%) so the preview never spills past either edge.
+      // We can't measure region width from inside the getter, so the
+      // clamp is in % space — translate(-50%) is the visual centering
+      // and `left` is the unclamped value.
+      return `left:${this.hoverPct}%;bottom:100%;`;
+    },
+
+    onTimelineLeave() {
+      this.hoverPct = null;
+      this._hoverPreviewKey = "";
+      this.hoverPreview = { visible: false, rows: [] };
     },
 
     get hoverTimeDisplay() {

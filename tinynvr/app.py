@@ -26,6 +26,7 @@ from tinynvr.config import (
 )
 from tinynvr.recorder import RecordingManager
 from tinynvr.retention import retention_loop
+from tinynvr.sprite import sprite_path_for
 
 
 def _configure_logging() -> None:
@@ -266,31 +267,44 @@ async def serve_segment(
     filename: str,
     request: Request,
 ) -> FileResponse:
-    """Serve a segment file statically.
+    """Serve a segment MP4 or its sibling sprite JPEG statically.
 
     Segments are self-contained MP4 with the moov atom at the start,
     so Starlette's FileResponse handles Range: requests natively and
-    Safari can byte-range seek into the middle of a segment.
+    Safari can byte-range seek into the middle of a segment. Sprite
+    requests share this route because a separately-declared
+    ``{filename}.jpg`` path would be shadowed by this ``{filename}``
+    catch-all (FastAPI matches in declaration order).
     """
     config: Config = request.app.state.config
     storage = Path(config.storage.path).resolve()
 
-    if not filename.endswith(".mp4"):
+    if filename.endswith(".jpg"):
+        stem = filename.removesuffix(".jpg")
+        media_type = "image/jpeg"
+        is_sprite = True
+    elif filename.endswith(".mp4"):
+        stem = filename.removesuffix(".mp4")
+        media_type = "video/mp4"
+        is_sprite = False
+    else:
         raise HTTPException(status_code=404, detail="Segment not found")
+
     try:
-        ts = datetime.strptime(
-            filename.removesuffix(".mp4"), "%Y-%m-%d_%H-%M-%S"
-        ).replace(tzinfo=UTC)
+        ts = datetime.strptime(stem, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=UTC)
     except ValueError:
         raise HTTPException(status_code=404, detail="Segment not found") from None
 
-    file_path = _segment_disk_path(storage, camera_name, int(ts.timestamp())).resolve()
+    segment_path = _segment_disk_path(
+        storage, camera_name, int(ts.timestamp())
+    ).resolve()
+    file_path = sprite_path_for(segment_path) if is_sprite else segment_path
     if not file_path.is_relative_to(storage) or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Segment not found")
 
     return FileResponse(
         file_path,
-        media_type="video/mp4",
+        media_type=media_type,
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
 

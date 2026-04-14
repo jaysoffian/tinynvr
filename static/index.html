@@ -361,6 +361,28 @@ html, body {
   white-space: nowrap;
   pointer-events: none;
 }
+.timeline-hover-preview {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 18px;
+  padding: 2px;
+  pointer-events: none;
+  transform: translateX(-50%);
+  z-index: 11;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  background: #000;
+  max-width: calc(100vw - 24px);
+  overflow: hidden;
+}
+.timeline-hover-preview-row {
+  background-repeat: no-repeat;
+  background-color: #111;
+  flex-shrink: 0;
+}
 
 /* Click overlay for scrubbing - covers tracks + hours */
 .timeline-click-overlay {
@@ -685,7 +707,7 @@ html, body {
           </a>
         </div>
         <video :id="'video-' + idx"
-               x-init="_debugInstrumentVideo(idx, $el)"
+               x-init="_initVideoEl(idx, $el)"
                preload="auto"
                muted
                playsinline>
@@ -769,11 +791,19 @@ html, body {
                    x-cloak
                    :style="'left:' + hoverPct + '%'"
                    x-text="hoverTimeDisplay"></div>
+              <div class="timeline-hover-preview"
+                   x-show="hoverPreview.visible"
+                   x-cloak
+                   :style="hoverPreviewStyle">
+                <template x-for="row in hoverPreview.rows" :key="row.cam">
+                  <div class="timeline-hover-preview-row" :style="row.style"></div>
+                </template>
+              </div>
               <div class="fs-timeline-click"
                    @mousedown.prevent="startFsScrubOrSelect($event)"
                    @mousemove="onTimelineHover($event)"
                    @mousemove.window="doFsScrub($event)"
-                   @mouseleave="hoverPct = null"
+                   @mouseleave="onTimelineLeave()"
                    @mouseup.window="endFsScrub()"
                    @touchstart.prevent="startFsScrub($event)"
                    @touchmove.window="doFsScrub($event.touches[0])"
@@ -832,13 +862,21 @@ html, body {
              x-cloak
              :style="'left:' + hoverPct + '%'"
              x-text="hoverTimeDisplay"></div>
+        <div class="timeline-hover-preview"
+             x-show="hoverPreview.visible"
+             x-cloak
+             :style="hoverPreviewStyle">
+          <template x-for="(row, i) in hoverPreview.rows" :key="row.cam">
+            <div class="timeline-hover-preview-row" :style="row.style"></div>
+          </template>
+        </div>
       </div>
       <!-- Invisible click overlay for scrubbing -->
       <div class="timeline-click-overlay"
            @mousedown.prevent="startScrubOrSelect($event)"
            @mousemove="onTimelineHover($event)"
            @mousemove.window="doScrub($event)"
-           @mouseleave="hoverPct = null"
+           @mouseleave="onTimelineLeave()"
            @mouseup.window="endScrub()"
            @touchstart.prevent="startScrub($event)"
            @touchmove.window="doScrub($event.touches[0])"

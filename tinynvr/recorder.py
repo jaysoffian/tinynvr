@@ -17,6 +17,7 @@ from asyncinotify import Inotify, Mask
 from tinynvr import db
 from tinynvr.config import CameraConfig, Config, StorageConfig, save_config
 from tinynvr.probe import probe_duration, unlink_unplayable
+from tinynvr.sprite import generate_sprite
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,7 @@ class CameraRecorder:
         self._process: asyncio.subprocess.Process | None = None
         self._monitor_task: asyncio.Task | None = None
         self._precreate_task: asyncio.Task | None = None
+        self._sprite_tasks: set[asyncio.Task] = set()
         self._should_run = False
         self._backoff = 1.0
 
@@ -299,6 +301,9 @@ class CameraRecorder:
                 size_bytes=size,
             )
             logger.info("Indexed %s for %s (%.1fs)", segment.name, self.name, dur)
+            task = asyncio.create_task(generate_sprite(segment))
+            self._sprite_tasks.add(task)
+            task.add_done_callback(self._sprite_tasks.discard)
         except Exception:
             logger.exception(
                 "Failed to index segment %s for %s", segment.name, self.name
