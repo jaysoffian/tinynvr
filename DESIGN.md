@@ -1,19 +1,15 @@
 # TinyNVR Design
 
 Small, self-hosted NVR for recording RTSP cameras and playing them
-back synchronously in a web UI. Optimized for a single household on
-a local NAS, not for multi-tenant or cloud deployment.
+back synchronously in a web UI.
 
 ## Scope
 
-- 4–8 RTSP cameras, already served by a local go2rtc (or directly).
-- Recording to local storage, never transcoding.
+- 4–8 RTSP H.264/AAC camera streams.
+- Record to local storage without transcoding.
 - Web UI for synced multi-camera playback with scrubbing, ~N-day
   retention, and a download-range button.
-- Target browser: Safari on macOS. It's the user's daily browser
-  and the one that has to feel right. Chrome and Firefox aren't
-  tested and aren't targeted — anything that works on Safari and
-  also happens to work on them is bonus, not requirement.
+- Target browser: Safari on macOS.
 
 ## Storage layout
 
@@ -22,33 +18,20 @@ a local NAS, not for multi-tenant or cloud deployment.
   tinynvr.db           # SQLite segment index (WAL mode)
   tinynvr.db-wal
   tinynvr.db-shm
-  2026-04-13/
-    04/
-      front-door/
-        26-56.mp4
-        27-02.mp4
-        ...
-      kitchen/
-        26-56.mp4
-        ...
-    05/
-      front-door/
-        ...
-  2026-04-14/
-    ...
+  YYYY-MM-DD/HH/<camera-name>/MM-SS.mp4
 ```
 
-- **Date-first, hour-bucketed.** Frigate-style layout: segments are
+- **Date-first, hour-bucketed.** Segments are
   grouped first by UTC date, then by hour, then by camera, then
-  minute-second leaf files. The single biggest benefit is retention:
-  an expired hour is one `shutil.rmtree` call per camera instead of
-  ~60 per-file `unlink`s.
+  minute-second leaf files. This layout was borrowed from Frigate NVR
+  and allows easy hourly retention cleanup: an expired hour is one
+  `shutil.rmtree` call.
 - Segment start time is fully encoded in the path components:
   `YYYY-MM-DD/HH/<camera>/MM-SS.mp4`. `_parse_segment_path` in
   `recorder.py` reconstructs the UTC start time from the path.
 - `.mp4` files are **self-contained** MP4 with `moov` at the front
   (ffmpeg `-segment_format mp4 -segment_format_options movflags=+faststart`).
-  This is load-bearing — see "Why not HLS?" and "Playback" below.
+  See "Why not HLS?" and "Playback" below.
 - The SQLite DB at `{storage.path}/tinynvr.db` is the segment index —
   one row per segment with `(camera, start_utc, duration_ms,
   size_bytes)`. It is the source of truth for all read paths
@@ -91,25 +74,20 @@ Every flag, and why it's there:
   where `_monitor` captures them into `last_error`. Without this,
   every restart dumps a codec table into the logs.
 - **`-rtsp_transport tcp`** — force TCP for the RTSP media
-  session. UDP is the default and drops packets under any load,
-  producing decode errors in the segments. TCP costs a bit of
-  latency (irrelevant for a recording NVR) and in exchange
-  delivers every frame on a LAN.
+  session because reliable delivery is important, latency is not critical,
+  and TCP is the default for go2rtc-provided RTSP streams.
 - **`-timeout 30000000`** — 30 seconds (in microseconds), the
   RTSP socket I/O timeout. If the upstream goes silent, ffmpeg
   exits with an error and `_monitor` restarts it with exponential
   backoff. Without a timeout, ffmpeg hangs forever on a stalled
-  TCP socket and no segments land on disk.
+  TCP socket and no segments land on disk. Shorter timeouts were
+  found to be too aggressive for go2rtc-provided streams.
 - **`-i <rtsp_url>`** — input URL from `config.yaml`, taken
   verbatim. The user is responsible for making sure the upstream
   emits H.264 + AAC; go2rtc's `?mp4` stream variant handles this.
-- **`-c copy`** — the load-bearing decision: nothing is ever
-  transcoded. ffmpeg is just demuxing RTSP and remuxing into MP4,
-  so CPU stays near zero on any host. The cost is that the
-  upstream must already be in a codec combination MP4 accepts —
-  if an RTSP source emits `pcm_mulaw` or similar directly,
-  segments fail to mux. Fix the upstream, don't add an encode
-  step here.
+- **`-c copy`** — No transcoding. ffmpeg is only demuxing RTSP and remuxing into
+  MP4 so CPU stays near zero on any host. The upstream must already
+  be in H.264/AAC format, otherwise segments fail to mux.
 - **`-metadata title=<camera_name>`** — embed the camera name in
   the MP4 `title` tag. Cosmetic: when a downloaded file is opened
   in QuickTime or VLC, the player shows the camera name instead
@@ -126,9 +104,8 @@ Every flag, and why it's there:
   one with a timestamp offset from some distant origin. Without
   this, seeking inside a segment would need context the file
   doesn't carry.
-- **`-segment_time 60`** — nominal segment length in seconds,
-  sourced from `_SEGMENT_SECONDS`. See the "Why 60 seconds"
-  discussion below.
+- **`-segment_time 60`** — nominal segment length in seconds.
+  See the "Why 60 seconds" discussion below.
 - **`-segment_format mp4`** — the inner muxer is non-fragmented
   MP4. The segment muxer's default is MPEG-TS, which would emit
   `.ts` files. We want MP4 specifically because (a) it's the
@@ -517,8 +494,8 @@ ffmpeg -hide_banner -loglevel error
   at `ss_offset` and stays tight. The re-encode is lossy but
   the output is still AAC in — it's a harmless single round-trip.
 - **`-movflags +frag_keyframe+empty_moov+default_base_moof`** —
-  output is **fragmented MP4**. This is load-bearing and
-  contradicts the on-disk format constraint by design: ffmpeg is
+  output is **fragmented MP4**. This contradicts the on-disk format
+  constraint by design: `ffmpeg` is
   writing to `pipe:1` (stdout) and pipes aren't seekable, but
   non-fragmented MP4 needs to seek back to the front of the file
   after mdat is written to fill in the `moov` atom. Fragmented
