@@ -15,7 +15,7 @@ CONFIG_PATH = Path(os.environ.get("TINYNVR_CONFIG", "config.yaml"))
 _yaml = YAML()
 _yaml.preserve_quotes = True
 
-_SEED_CONFIG = """\
+SEED_CONFIG = """\
 storage:
   path: /recordings
   retention_days: 7
@@ -67,7 +67,7 @@ def load_config(path: Path | None = None) -> Config:
     if not config_path.exists():
         logger.warning("Config file %s not found, seeding default config", config_path)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(_SEED_CONFIG)
+        config_path.write_text(SEED_CONFIG)
         return load_config(config_path)
 
     raw = _yaml.load(config_path)

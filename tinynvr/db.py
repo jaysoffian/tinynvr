@@ -1,13 +1,9 @@
 """SQLite-backed segment index.
 
-One DB file at ``{storage}/tinynvr.db`` replaces the per-camera daily
-``.idx`` text files. The recorder is the sole writer; FastAPI handlers
-and the retention loop are readers. WAL mode lets them coexist without
-a lock dance.
-
-Rows are inserted after a segment is probed successfully. Unplayable
-segments are deleted from disk and never get a row — there is no
-"duration 0" sentinel.
+One DB file at ``{storage}/tinynvr.db`` in WAL mode. The recorder is the sole
+writer; FastAPI handlers and the retention loop are readers. Rows are inserted
+after a segment is probed successfully. Unplayable segments are deleted from
+disk and never get a row.
 """
 
 import logging
@@ -16,55 +12,50 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_DB_FILENAME = "tinynvr.db"
-_state: dict[str, sqlite3.Connection | None] = {"conn": None}
-
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS segments (
-  camera      TEXT    NOT NULL,
-  start_utc   INTEGER NOT NULL,
-  duration_ms INTEGER NOT NULL,
-  size_bytes  INTEGER NOT NULL,
-  PRIMARY KEY (camera, start_utc)
-) WITHOUT ROWID;
-
-CREATE INDEX IF NOT EXISTS idx_segments_start ON segments(start_utc);
-"""
+db_conn: sqlite3.Connection | None = None
 
 
 def init_db(storage_path: str) -> None:
     """Open the connection, apply PRAGMAs, create schema if missing."""
-    if _state["conn"] is not None:
+    global db_conn  # noqa: PLW0603
+    if db_conn is not None:
         return
     root = Path(storage_path)
     root.mkdir(parents=True, exist_ok=True)
-    db_path = root / _DB_FILENAME
-    conn = sqlite3.connect(
+    db_path = root / "tinynvr.db"
+    db_conn = sqlite3.connect(
         str(db_path),
         isolation_level=None,
         check_same_thread=False,
     )
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(_SCHEMA)
-    _state["conn"] = conn
+    db_conn.execute("PRAGMA journal_mode=WAL")
+    db_conn.execute("PRAGMA synchronous=NORMAL")
+    db_conn.executescript("""
+        CREATE TABLE IF NOT EXISTS segments (
+          camera      TEXT    NOT NULL,
+          start_utc   INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          size_bytes  INTEGER NOT NULL,
+          PRIMARY KEY (camera, start_utc)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS idx_segments_start ON segments(start_utc);
+    """)
     logger.info("Opened segment index at %s", db_path)
 
 
 def close_db() -> None:
-    conn = _state["conn"]
-    if conn is not None:
-        conn.close()
-        _state["conn"] = None
+    global db_conn  # noqa: PLW0603
+    if db_conn is not None:
+        db_conn.close()
+        db_conn = None
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = _state["conn"]
-    if conn is None:
+    if db_conn is None:
         msg = "db.init_db() has not been called"
         raise RuntimeError(msg)
-    return conn
+    return db_conn
 
 
 def insert_segment(

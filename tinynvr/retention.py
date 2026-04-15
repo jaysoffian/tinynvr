@@ -12,7 +12,7 @@ from tinynvr import db
 
 logger = logging.getLogger(__name__)
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
@@ -40,7 +40,7 @@ def cleanup_old_segments(storage_path: str, retention_days: int) -> int:
 
     deleted_hours = 0
     for date_dir in sorted(root.iterdir()):
-        if not date_dir.is_dir() or not _DATE_RE.match(date_dir.name):
+        if not date_dir.is_dir() or not DATE_RE.match(date_dir.name):
             continue
         try:
             d = date.fromisoformat(date_dir.name)

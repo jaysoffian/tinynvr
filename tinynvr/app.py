@@ -87,11 +87,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 
-_VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
+VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 try:
-    _VERSION = _VERSION_FILE.read_text().strip() or "dev"
+    VERSION = VERSION_FILE.read_text().strip() or "dev"
 except OSError:
-    _VERSION = "dev"
+    VERSION = "dev"
 
 
 @app.get("/api/config")
@@ -103,7 +103,7 @@ async def get_config(request: Request) -> dict:
 @app.get("/api/version")
 async def get_version() -> dict:
     """Return the short git commit baked into the image at build time."""
-    return {"commit": _VERSION}
+    return {"commit": VERSION}
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ async def get_version() -> dict:
 # playback investigation is done.
 # ---------------------------------------------------------------------------
 
-_DEBUG_LOG_PATH = Path("/tmp/tinynvr-debug.log")
+DEBUG_LOG_PATH = Path("/tmp/tinynvr-debug.log")
 
 
 @app.post("/api/debug/log")
@@ -124,7 +124,7 @@ async def debug_log_write(request: Request) -> dict:
     if not isinstance(events, list):
         raise HTTPException(status_code=400, detail="'events' must be a list")
     try:
-        with _DEBUG_LOG_PATH.open("a") as f:
+        with DEBUG_LOG_PATH.open("a") as f:
             for event in events:
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
     except OSError as exc:
@@ -137,7 +137,7 @@ async def debug_log_write(request: Request) -> dict:
 async def debug_log_read() -> PlainTextResponse:
     """Return the full debug log as plain text, or an empty body if absent."""
     try:
-        content = _DEBUG_LOG_PATH.read_text()
+        content = DEBUG_LOG_PATH.read_text()
     except OSError:
         content = ""
     return PlainTextResponse(content)
@@ -147,7 +147,7 @@ async def debug_log_read() -> PlainTextResponse:
 async def debug_log_clear() -> dict:
     """Truncate the debug log."""
     try:
-        _DEBUG_LOG_PATH.unlink(missing_ok=True)
+        DEBUG_LOG_PATH.unlink(missing_ok=True)
     except OSError as exc:
         logger.warning("debug log clear failed: %s", exc)
         raise HTTPException(status_code=500, detail="debug log unavailable") from None

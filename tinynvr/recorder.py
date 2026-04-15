@@ -21,9 +21,8 @@ from tinynvr.sprite import generate_sprite
 
 logger = logging.getLogger(__name__)
 
-_SEGMENT_SECONDS = 60
-_probe_duration = partial(probe_duration, max_duration=_SEGMENT_SECONDS * 1.5)
-_SEGMENT_PATH_RE = re.compile(
+SEGMENT_SECONDS = 60
+SEGMENT_PATH_RE = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"/(?P<hour>\d{2})"
     r"/(?P<camera>[^/]+)"
@@ -38,6 +37,9 @@ class CameraState(StrEnum):
     ERROR = "error"
 
 
+_probe_duration = partial(probe_duration, max_duration=SEGMENT_SECONDS * 1.5)
+
+
 def _parse_segment_path(
     path: Path,
     storage_root: Path,
@@ -47,7 +49,7 @@ def _parse_segment_path(
         rel = path.relative_to(storage_root)
     except ValueError:
         return None
-    m = _SEGMENT_PATH_RE.match(rel.as_posix())
+    m = SEGMENT_PATH_RE.match(rel.as_posix())
     if m is None:
         return None
     try:
@@ -202,7 +204,7 @@ class CameraRecorder:
             "-reset_timestamps",
             "1",
             "-segment_time",
-            str(_SEGMENT_SECONDS),
+            str(SEGMENT_SECONDS),
             "-segment_format",
             "mp4",
             "-segment_format_options",

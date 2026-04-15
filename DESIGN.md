@@ -41,8 +41,7 @@ back synchronously in a web UI.
 
 ## Recording pipeline
 
-`tinynvr/recorder.py` runs one ffmpeg subprocess per enabled
-camera. The full argv:
+`tinynvr/recorder.py` runs one ffmpeg subprocess per enabled camera. The full argv:
 
 ```
 ffmpeg
@@ -67,7 +66,7 @@ environment so strftime in the output pattern always expands to
 UTC regardless of the container's timezone. If this ever leaks,
 segment paths and `_parse_segment_path` fall out of sync.
 
-Every flag, and why it's there:
+Explanation of various switches:
 
 - **`-hide_banner -loglevel warning`** — suppress the startup
   banner and info chatter. Warnings and errors still reach stderr
@@ -141,9 +140,7 @@ Every flag, and why it's there:
 
 ### Why 60 seconds
 
-Segment length is fixed at 60 seconds and intentionally not
-configurable. Three things scale with segment length, and all
-three favor short segments:
+Segment length is fixed at 60 seconds. Three things scale with segment length, and all three favor short segments:
 
 - **Playback latency to "live"**: a segment isn't playable until
   ffmpeg closes it (the `moov` atom is written on close), so the
@@ -588,8 +585,8 @@ thing it was going to earn us was gapless playback, and
 MSE + mp4box.js got us that without changing the on-disk format.
 
 A fragmented-MP4 HLS retry via Safari's native `<video
-src="playlist.m3u8">` was planned on the delete `hls` branch but
-never implemented. If scrub-latency
+src="playlist.m3u8">` was planned on the deleted `hls` branch
+but never implemented. If scrub-latency
 pain ever makes this worth revisiting, the plan is there — but
 scope what's actually needed instead of picking it up whole.
 
